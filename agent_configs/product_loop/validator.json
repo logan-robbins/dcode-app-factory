@@ -1,0 +1,1 @@
+{"stage":"product_loop","role":"validator","model_tier":"efficient","temperature":0.0,"max_context_tokens":32000,"context_policy":"no_history","allowed_context_sections":["structured_spec_draft","validation_rules"]}

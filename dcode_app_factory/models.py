@@ -1,91 +1,155 @@
-"""Dataclass models for the AI software product factory.
-
-This module provides plain Python dataclasses that mirror the shape of
-the Pydantic models described in the specification. Dataclasses are
-used instead of Pydantic to avoid reliance on external packages that
-may not be available in the execution environment. The dataclasses
-include simple default values and type hints but no runtime
-validation beyond Python's built‑in type system.
-"""
-
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from dataclasses import dataclass, field
-from typing import List, Optional
+from enum import Enum
+from typing import Any
+
+
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    HALTED = "halted"
 
 
 @dataclass(frozen=True)
-class InputSpec:
-    """Describes a single input parameter for a micro module."""
-    name: str
-    type: str
-    description: Optional[str] = None
+class IOContractSketch:
+    """Contract sketch required at Product Loop stage."""
 
+    inputs: list[str]
+    outputs: list[str]
+    error_surfaces: list[str]
+    effects: list[str]
+    modes: list[str]
 
-@dataclass(frozen=True)
-class OutputSpec:
-    """Describes a single output value for a micro module."""
-    name: str
-    type: str
-    description: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class ErrorSpec:
-    """Describes an error condition that a micro module may raise."""
-    code: str
-    message: str
+    def validate_complete(self) -> None:
+        fields = {
+            "inputs": self.inputs,
+            "outputs": self.outputs,
+            "error_surfaces": self.error_surfaces,
+            "effects": self.effects,
+            "modes": self.modes,
+        }
+        placeholders = {"tbd", "todo", "n/a", "na", "none"}
+        for field_name, values in fields.items():
+            if not values:
+                raise ValueError(f"io_contract_sketch.{field_name} cannot be empty")
+            lowered = {value.strip().lower() for value in values if value.strip()}
+            if lowered & placeholders:
+                raise ValueError(f"io_contract_sketch.{field_name} contains placeholders")
 
 
 @dataclass(frozen=True)
 class MicroModuleContract:
-    """A contract describing a micro module's interface."""
+    """Final micro-module contract used by Engineering Loop."""
+
+    module_id: str
     name: str
     description: str
-    version: str = "0.1.0"
-    inputs: List[InputSpec] = field(default_factory=list)
-    outputs: List[OutputSpec] = field(default_factory=list)
-    errors: List[ErrorSpec] = field(default_factory=list)
-    depends_on: List[str] = field(default_factory=list)
+    inputs: list[dict[str, str]]
+    outputs: list[dict[str, str]]
+    error_surfaces: list[dict[str, str]]
+    effects: list[str]
+    modes: list[str]
+    depends_on: list[str] = field(default_factory=list)
+
+    @property
+    def fingerprint(self) -> str:
+        payload = {
+            "module_id": self.module_id,
+            "name": self.name,
+            "description": self.description,
+            "inputs": self.inputs,
+            "outputs": self.outputs,
+            "error_surfaces": self.error_surfaces,
+            "effects": self.effects,
+            "modes": self.modes,
+            "depends_on": self.depends_on,
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclass
 class Task:
-    """Represents a single implementable task derived from the structured spec."""
+    task_id: str
     name: str
     description: str
-    contract: Optional[MicroModuleContract] = None
-    status: str = "pending"
-    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    subtasks: list[str]
+    acceptance_criteria: list[str]
+    io_contract_sketch: IOContractSketch
+    depends_on: list[str] = field(default_factory=list)
+    status: TaskStatus = TaskStatus.PENDING
+    contract: MicroModuleContract | None = None
 
 
 @dataclass
 class Story:
-    """User‑facing behaviour grouped under an epic."""
+    story_id: str
     name: str
     description: str
-    tasks: List[Task] = field(default_factory=list)
+    user_facing_behavior: str
+    tasks: list[Task]
 
 
 @dataclass
 class Epic:
-    """Major capability within a pillar."""
+    epic_id: str
     name: str
     description: str
-    stories: List[Story] = field(default_factory=list)
+    success_criteria: list[str]
+    stories: list[Story]
 
 
 @dataclass
 class Pillar:
-    """Strategic theme in the structured specification."""
+    pillar_id: str
     name: str
     description: str
-    epics: List[Epic] = field(default_factory=list)
+    rationale: str
+    epics: list[Epic]
 
 
 @dataclass
 class StructuredSpec:
-    """Top‑level structured specification produced by the Product Loop."""
-    pillars: List[Pillar] = field(default_factory=list)
-    version: str = "0.1.0"
+    product_name: str
+    vision: str
+    constraints: list[str]
+    pillars: list[Pillar]
+    version: str = "2026.1"
+
+
+@dataclass(frozen=True)
+class ContextPack:
+    """Deterministic context pack for one agent invocation."""
+
+    task_id: str
+    objective: str
+    interfaces: list[str]
+    allowed_files: list[str]
+    denied_files: list[str]
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    """Runtime config for one agent role."""
+
+    stage: str
+    role: str
+    model_tier: str
+    temperature: float
+    max_context_tokens: int
+    context_policy: str
+    allowed_context_sections: list[str]
+
+
+@dataclass
+class DebateTrace:
+    trace_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    proposal: str = ""
+    challenge: str = ""
+    adjudication: str = ""
+    passed: bool = False
