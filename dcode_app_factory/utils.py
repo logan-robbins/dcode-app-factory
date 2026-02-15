@@ -1,56 +1,71 @@
-"""Utility functions for the AI software product factory.
-
-This module collects helper functions used throughout the package,
-including slugifying names for safe file and identifier generation and
-producing canonical JSON strings. These utilities wrap third‑party
-libraries to provide a consistent API.
-"""
-
 from __future__ import annotations
 
+import json
+import re
+from collections import defaultdict, deque
+from pathlib import Path
 from typing import Any
 
-import re
-import json
+from .models import AgentConfig, ContextPack, StructuredSpec
 
 
 def slugify_name(name: str) -> str:
-    """Return a URL‑ and filename‑safe slug for the given name.
-
-    The slug is lower‑cased, uses hyphens as separators, and strips
-    characters that are unsafe for file systems. Consecutive
-    separators are collapsed into a single hyphen. Leading and
-    trailing hyphens are removed.
-
-    This implementation avoids external dependencies by using a
-    regular expression to replace non‑alphanumeric characters with
-    hyphens.
-
-    Args:
-        name: Arbitrary input string.
-
-    Returns:
-        A slugified version of the input.
-    """
-    # Lowercase and replace any sequence of non‑alphanumeric characters with a hyphen
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", name.lower())
-    # Strip leading and trailing hyphens
-    slug = slug.strip("-")
-    return slug
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", name.lower()).strip("-")
+    return re.sub(r"-{2,}", "-", slug)
 
 
 def to_canonical_json(value: Any) -> str:
-    """Serialize a value to a deterministic JSON string.
-
-    Keys are sorted alphabetically and all unnecessary whitespace is
-    removed. This is a pragmatic substitute for full RFC 8785
-    canonicalisation and suffices for hashing or comparison in the
-    absence of an external dependency.
-
-    Args:
-        value: Any JSON‑serialisable object (dict, list, int, str, etc.).
-
-    Returns:
-        A string containing the canonical JSON representation of the input.
-    """
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def load_agent_config(path: Path) -> AgentConfig:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return AgentConfig(**payload)
+
+
+def validate_task_dependency_dag(spec: StructuredSpec) -> None:
+    tasks = {}
+    for pillar in spec.pillars:
+        for epic in pillar.epics:
+            for story in epic.stories:
+                for task in story.tasks:
+                    if task.task_id in tasks:
+                        raise ValueError(f"Duplicate task_id: {task.task_id}")
+                    tasks[task.task_id] = task
+
+    indegree = {task_id: 0 for task_id in tasks}
+    outgoing = defaultdict(list)
+    for task_id, task in tasks.items():
+        for dep in task.depends_on:
+            if dep not in tasks:
+                raise ValueError(f"Task {task_id} depends on unknown task {dep}")
+            outgoing[dep].append(task_id)
+            indegree[task_id] += 1
+
+    queue = deque([task_id for task_id, degree in indegree.items() if degree == 0])
+    visited = 0
+    while queue:
+        current = queue.popleft()
+        visited += 1
+        for neighbor in outgoing[current]:
+            indegree[neighbor] -= 1
+            if indegree[neighbor] == 0:
+                queue.append(neighbor)
+
+    if visited != len(tasks):
+        raise ValueError("Task dependency graph contains a cycle")
+
+
+def build_context_pack(task_id: str, objective: str, stage: str) -> ContextPack:
+    base_interfaces = [
+        "MicroModuleContract",
+        "CodeIndex.register(contract)",
+        "Debate: propose->challenge->adjudicate",
+    ]
+    return ContextPack(
+        task_id=task_id,
+        objective=objective,
+        interfaces=base_interfaces,
+        allowed_files=[f"state_store/tasks/{task_id}.md", f"state_store/context/{stage}/{task_id}.json"],
+        denied_files=["state_store/code_index/*.json", "**/*.py"],
+    )

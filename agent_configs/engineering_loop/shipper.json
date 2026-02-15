@@ -1,0 +1,1 @@
+{"stage":"engineering_loop","role":"shipper","model_tier":"efficient","temperature":0.0,"max_context_tokens":12000,"context_policy":"immutable_artifacts_only","allowed_context_sections":["adjudication_result","ship_evidence","code_index_append"]}
