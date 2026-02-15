@@ -1,0 +1,16 @@
+[project]
+name = "dcode_app_factory"
+version = "0.1.0"
+description = "A skeleton implementation of an AI software product factory with product, project and engineering loops."
+requires-python = ">=3.12"
+
+# Note: We intentionally omit declaring dependencies here because the
+# execution environment is offline and cannot install packages from
+# external repositories. The code is written to avoid dependencies
+# beyond the Python standard library. Pytest is assumed to be
+# available in the system environment for running tests.
+dependencies = []
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

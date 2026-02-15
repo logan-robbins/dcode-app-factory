@@ -1,0 +1,33 @@
+# Development Tasks
+
+This document outlines the high‑level tasks required to build a skeleton
+implementation of the **AI software product factory** described in the
+specification. Items are numbered and should be updated as work
+progresses. Completed items should be annotated with a status mark.
+
+1. **Project initialization** – Create a `pyproject.toml` with the
+   appropriate metadata and dependencies and initialise the virtual
+   environment using `uv`. ✅
+2. **Directory structure** – Create a Python package under
+   `dcode_app_factory` and submodules for loops, data models, and
+   infrastructure. ✅
+3. **Data modelling** – Define data classes (using the standard
+   library `dataclasses`) to represent the structured specification
+   (pillars, epics, stories, tasks) and micro‑module contracts
+   (inputs, outputs, errors). ✅
+4. **Micro‑module registry** – Implement a registry that records
+   available micro modules and their metadata in a Code Index. ✅
+5. **Loop implementations** – Implement skeleton classes for the
+   Product Loop, Project Loop, and Engineering Loop. Each loop should
+   expose a `run()` method that logs or returns its progress. ✅
+6. **Debate mechanism** – Implement a minimal debate mechanism that
+   simulates proposal, challenge, and adjudication phases between
+   placeholder agents. The mechanism should return PASS/FAIL results
+   without invoking any external models. ✅
+7. **CLI entry point** – Provide a `factory_main.py` script under
+   `scripts` that instantiates and runs the loops in sequence. ✅
+8. **Unit tests** – Write pytest suites under the `tests` directory
+   covering data modelling, registry operations, loop sequencing, and
+   the debate mechanism. ✅
+9. **Documentation update** – Update `README.md` to reflect the
+   current system, installation instructions, and usage. ✅
