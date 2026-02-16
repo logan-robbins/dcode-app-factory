@@ -11,6 +11,11 @@ requires-python = ">=3.12"
 # Runtime dependencies are intentionally empty. This skeleton package
 # uses the Python standard library only.
 dependencies = [
+    "chromadb",
+    "deepagents",
+    "langchain",
+    "langgraph",
+    "pydantic",
     "rfc8785>=0.1.4",
 ]
 
