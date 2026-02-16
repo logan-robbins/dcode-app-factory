@@ -2,6 +2,7 @@ from importlib.metadata import version
 
 from .debate import Debate, DebateResult
 from .loops import EngineeringLoop, ProductLoop, ProjectLoop
+from .model_selection import DEFAULT_MODELS_BY_TIER, RuntimeModelSelection, resolve_agent_models
 from .models import (
     AgentConfig,
     ContextPack,
@@ -43,6 +44,7 @@ __all__ = [
     "Pillar",
     "ProductLoop",
     "ProjectLoop",
+    "RuntimeModelSelection",
     "ShipEvidence",
     "Story",
     "StructuredSpec",
@@ -52,4 +54,6 @@ __all__ = [
     "slugify_name",
     "to_canonical_json",
     "validate_task_dependency_dag",
+    "DEFAULT_MODELS_BY_TIER",
+    "resolve_agent_models",
 ]

@@ -16,6 +16,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 from dcode_app_factory import CodeIndex, ProductLoop, ProjectLoop
+from dcode_app_factory.settings import RuntimeSettings
 
 
 DEFAULT_SPEC_TEXT = "Placeholder specification for dcode_app_factory."
@@ -39,6 +40,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_raw_spec(spec_file: Path | None) -> str:
+    settings = RuntimeSettings.from_env()
     if spec_file is not None:
         if not spec_file.is_file():
             raise FileNotFoundError(
@@ -46,7 +48,7 @@ def load_raw_spec(spec_file: Path | None) -> str:
             )
         return spec_file.read_text(encoding="utf-8")
 
-    default_path = REPO_ROOT / "SPEC.md"
+    default_path = settings.default_spec_file(REPO_ROOT)
     if default_path.is_file():
         return default_path.read_text(encoding="utf-8")
 

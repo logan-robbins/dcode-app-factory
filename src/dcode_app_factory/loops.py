@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 from .debate import Debate, DebateResult
+from .model_selection import RuntimeModelSelection, resolve_agent_models
 from .models import (
     Epic,
     EscalationArtifact,
@@ -19,6 +20,7 @@ from .models import (
     TaskStatus,
 )
 from .registry import CodeIndex
+from .settings import RuntimeSettings
 from .utils import (
     build_context_pack,
     get_agent_config_dir,
@@ -35,8 +37,10 @@ class ProductLoop:
 
     def __init__(self, raw_spec: str, config_dir: str | Path | None = None) -> None:
         self.raw_spec = raw_spec
+        self.settings = RuntimeSettings.from_env()
         self.config_dir = Path(config_dir) if config_dir is not None else get_agent_config_dir("product_loop")
         self.agent_configs = self._load_configs()
+        self.role_models = resolve_agent_models(self.agent_configs, RuntimeModelSelection.from_env())
 
     def _load_configs(self) -> dict[str, object]:
         return {
@@ -81,7 +85,10 @@ class ProductLoop:
 
     def run(self) -> StructuredSpec:
         sections = self._extract_sections()
-        tasks = [self._task_from_section(section, idx + 1) for idx, section in enumerate(sections[:8])]
+        tasks = [
+            self._task_from_section(section, idx + 1)
+            for idx, section in enumerate(sections[: self.settings.max_product_sections])
+        ]
         for idx in range(1, len(tasks)):
             tasks[idx].depends_on.append(tasks[idx - 1].task_id)
         story = Story(
@@ -137,12 +144,14 @@ class EngineeringLoop:
         self.task = task
         self.code_index = code_index
         self.max_retries = max_retries
+        self.settings = RuntimeSettings.from_env()
         self.config_dir = Path(config_dir) if config_dir is not None else get_agent_config_dir("engineering_loop")
         self.escalation: EscalationArtifact | None = None
         self.agent_configs = {
             path.stem: load_agent_config(path)
             for path in sorted(self.config_dir.glob("*.json"))
         }
+        self.role_models = resolve_agent_models(self.agent_configs, RuntimeModelSelection.from_env())
 
     def _proposer(self, task_prompt: str, _context) -> str:
         _ = task_prompt, self.agent_configs.get("proposer")
@@ -177,7 +186,13 @@ class EngineeringLoop:
     def run(self) -> bool:
         self.task.status = TaskStatus.IN_PROGRESS
         proposer_cfg = self.agent_configs["proposer"]
-        context = build_context_pack(self.task.task_id, self.task.description, stage="engineering_loop", config=proposer_cfg)
+        context = build_context_pack(
+            self.task.task_id,
+            self.task.description,
+            stage="engineering_loop",
+            config=proposer_cfg,
+            settings=self.settings,
+        )
 
         debate = Debate(self._proposer, self._challenger, self._arbiter)
         last_trace = None
@@ -216,6 +231,7 @@ class ProjectLoop:
             path.stem: load_agent_config(path)
             for path in sorted(self.config_dir.glob("*.json"))
         }
+        self.role_models = resolve_agent_models(self.agent_configs, RuntimeModelSelection.from_env())
 
     def _flatten_tasks(self) -> list[Task]:
         return self.spec.iter_tasks()

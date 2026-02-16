@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
+
+from .canonical import to_canonical_json
 
 
 class TaskStatus(str, Enum):
@@ -77,7 +78,7 @@ class MicroModuleContract:
             "modes": self.modes,
             "depends_on": self.depends_on,
         }
-        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        canonical = to_canonical_json(payload)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
