@@ -78,3 +78,10 @@ progresses. Completed items should be annotated with a status mark.
 4. **Verify** – Run `uv run pytest -q` and confirm no regressions. ✅
 5. **Update** – Refresh `README.md` if behavior/commands changed and
    finalize task status annotations. ✅
+
+## SPEC gap implementation kickoff (2026-02-16)
+
+1. **State store foundation** – Added filesystem-backed project state store with `state_machine/state.json` persistence. ✅
+2. **Transition guardrails** – Added explicit legal task transition validator for project state-machine status changes. ✅
+3. **Artifact envelope baseline** – Added minimal universal artifact envelope and persisted ship-evidence artifacts under `state_store/artifacts/`. ✅
+4. **Validation coverage** – Added tests for state persistence, artifact output, and illegal transition rejection. ✅

@@ -19,6 +19,7 @@ from dcode_app_factory import (
 )
 from dcode_app_factory.models import IOContractSketch, StructuredSpec
 from dcode_app_factory.settings import RuntimeSettings
+from dcode_app_factory.state_store import ProjectStateMachine, TaskStateEntry
 from dcode_app_factory.utils import build_context_pack, load_agent_config, validate_task_dependency_dag
 
 
@@ -134,6 +135,41 @@ def test_end_to_end_project_loop_happy_path() -> None:
     assert all(task.contract is not None for task in tasks)
     assert all(task.ship_evidence is not None for task in tasks)
     assert len(code_index) == len(tasks)
+
+
+def test_project_loop_persists_state_machine_and_artifacts(tmp_path: Path) -> None:
+    raw_spec = "# Product\n## Loop A\n## Loop B"
+    spec = ProductLoop(raw_spec).run()
+
+    code_index = CodeIndex()
+    project_loop = ProjectLoop(spec, code_index, state_store_root=tmp_path / "state_store")
+    assert project_loop.run() is True
+
+    state_json = tmp_path / "state_store" / "state_machine" / "state.json"
+    assert state_json.is_file()
+    data = state_json.read_text(encoding="utf-8")
+    assert '"declaration_order": 0' in data
+    assert '"status": "completed"' in data
+
+    artifacts_dir = tmp_path / "state_store" / "artifacts"
+    assert artifacts_dir.is_dir()
+    ship_artifacts = list(artifacts_dir.glob("ship-evidence-*.json"))
+    assert len(ship_artifacts) == len(spec.iter_tasks())
+
+
+def test_state_machine_rejects_illegal_transition() -> None:
+    state = ProjectStateMachine(
+        tasks={
+            "TASK-001": TaskStateEntry(
+                task_id="TASK-001",
+                status=TaskStatus.PENDING.value,
+                depends_on=[],
+                declaration_order=0,
+            )
+        }
+    )
+    with pytest.raises(ValueError):
+        state.assert_valid_transition("TASK-001", TaskStatus.PENDING, TaskStatus.COMPLETED)
 
 
 def test_project_loop_blocks_downstream_when_engineering_fails() -> None:

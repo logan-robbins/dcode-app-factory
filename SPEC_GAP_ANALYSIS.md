@@ -72,7 +72,7 @@ This audit compares the requirements in `SPEC.md` against the current repository
 
 | Spec requirement | Current state | Gap |
 |---|---|---|
-| Append-only Code Index with one-way status transitions (`SHIPPED`→`DEPRECATED/SUPERSEDED`) | In-memory append-only registration exists, but no status model or one-way transition controls. | **Partial/Missing**. |
+| Append-only Code Index with simplified lifecycle transitions (`CURRENT`→`DEPRECATED`) | In-memory append-only registration exists, but no status model or one-way transition controls. | **Partial/Missing**. |
 | Embedded vector store + semantic search | Not implemented (no ChromaDB/equivalent integration). | **Missing**. |
 | Reuse-first policy with mandatory `ReuseSearchReport` before `CREATE_NEW` | No reuse search/report flow exists. | **Missing**. |
 | Deprecation metadata and replacement pointers | Not implemented. | **Missing**. |
@@ -123,7 +123,7 @@ This audit compares the requirements in `SPEC.md` against the current repository
 7. Interface-change exception lifecycle.
 8. Reuse-search governance and report validation.
 9. Embedded vector Code Index + semantic retrieval.
-10. Module status lifecycle (`SHIPPED/DEPRECATED/SUPERSEDED`) and one-way transitions.
+10. Module status lifecycle (`CURRENT/DEPRECATED`) with one-way transitions.
 11. Release stage implementation and deprecation checks.
 12. LangGraph/deepagents implementation, checkpointing, recursion/state-key mitigations.
 13. Crash recovery tests.
