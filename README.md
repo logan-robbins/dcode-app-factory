@@ -1,112 +1,89 @@
 # dcode_app_factory
 
-This repository contains a **skeleton implementation** of an AI software
-product factory as outlined in the provided specification. The intent
-of this project is not to fully realise the ambitious design but to
-demonstrate the core concepts in a minimal, deterministic form.
+`dcode_app_factory` is a deterministic skeleton of the AI Software Product
+Factory described in `SPEC.md`.
 
-## Architecture Overview
+It currently demonstrates:
 
-The factory is organised into three orchestrated loops, each
-responsible for a distinct phase of software production:
+1. Product loop: creates a structured spec placeholder.
+2. Project loop: flattens tasks and dispatches them sequentially.
+3. Engineering loop: runs a propose/challenge/adjudicate flow and registers module contracts.
 
-1. **Product Loop** – Converts a high‑level specification into a
-   structured specification comprising pillars, epics, stories and
-   tasks. In this skeleton the Product Loop simply generates a single
-   placeholder pillar containing one epic, one story and one task
-   without performing any research【972992892572183†L90-L107】.
-2. **Project Loop** – Decomposes the structured specification into a
-   flat list of tasks and dispatches them to the Engineering Loop
-   sequentially. Execution halts on the first failure【972992892572183†L90-L116】.
-3. **Engineering Loop** – Implements a single task by performing a
-   mock “debate” consisting of propose, challenge and adjudicate
-   phases. Success marks the task as completed and registers its
-   contract in the Code Index; failure marks the task as failed and
-   stops the project.
+## Requirements
 
-Supporting these loops are several small components:
+1. Python 3.12+
+2. `uv`
 
-* **Data models** – Plain Python dataclasses represent the structured
-  specification and micro‑module contracts. No external validation
-  library is required.
-* **Code Index** – An in‑memory registry of micro‑module contracts
-  keyed by a slugified version of the module name. It provides
-  registration and lookup functionality.
-* **Debate mechanism** – A lightweight engine that executes a
-  deterministic proposal/challenge/adjudication sequence.
-
-## Installation
-
-The project avoids external dependencies to remain runnable in an
-offline environment. A `pyproject.toml` is provided for completeness
-but declares no runtime dependencies. The only requirement is
-Python 3.12 or newer. Although the original specification calls for
-dependency management via `uv` and a dedicated virtual environment,
-network restrictions prevent retrieving packages from external
-repositories. Therefore the factory runs against the system Python
-environment.
-
-To install development dependencies manually (optional), ensure
-pytest is available in your environment. On a system with internet
-access this could be achieved with `pip install pytest`, but in the
-offline execution environment used here pytest is already provided.
-
-## Running the Factory
-
-The main entry point is `scripts/factory_main.py`. It reads an
-optional `SPEC.md` file, runs the Product Loop to produce a
-structured specification, then runs the Project Loop and the
-Engineering Loop for each task. The registered micro‑modules are
-listed at the end.
+## Setup
 
 ```bash
-# From the repository root, run the factory with the default placeholder spec
-PYTHONPATH=$(pwd) python scripts/factory_main.py
-
-# Or provide a path to an existing SPEC.md
-PYTHONPATH=$(pwd) python scripts/factory_main.py --spec-file path/to/SPEC.md
+uv sync --all-groups --frozen
 ```
 
-Running under `uv` is also possible, but only the `--active`
-environment flag can be used because the offline environment cannot
-create a fully populated virtual environment:
+If you are initializing locally without an existing lock environment, use:
 
 ```bash
-PYTHONPATH=$(pwd) uv run --active python scripts/factory_main.py
+uv sync --all-groups
 ```
 
-## Testing
+## Run
 
-Unit tests are located in the `tests/` directory and can be executed
-with pytest. Because the project is not installed into a virtual
-environment, `PYTHONPATH` must be set to include the repository
-root:
+Run with auto-loaded `SPEC.md` (if present):
 
 ```bash
-PYTHONPATH=$(pwd) pytest -q
+uv run python scripts/factory_main.py
 ```
 
-The tests cover slugification, canonical JSON serialization, registry
-behaviour, and the end‑to‑end execution of the loops.
+Run with an explicit spec path:
 
-## Limitations & Future Work
+```bash
+uv run python scripts/factory_main.py --spec-file SPEC.md
+```
 
-This project is intentionally minimal and deterministic. Key
-limitations include:
+The script prints:
 
-* **No actual research or planning** – The Product Loop does not
-  expand or refine the spec using external knowledge sources.
-* **No multi‑agent debate** – The Engineering Loop uses a single
-  propositional function and trivial challenge/adjudication, rather
-  than three distinct agents.
-* **No persistence** – The Code Index is in‑memory and is lost
-  between runs.
-* **No concurrency** – Tasks are executed sequentially; there is no
-  parallelism or retry logic.
+1. `project_success=<true|false>`
+2. Registered micro-module contracts from the in-memory Code Index
 
-Despite these simplifications, the skeleton captures the essence of the
-factory architecture: structured decomposition of a spec, single‑task
-execution with context isolation, and an append‑only registry of
-micro‑modules【972992892572183†L90-L116】. Extending the system to meet the full
-specification would involve integrating research tools, state machines,
-robust agentic debate and persistent storage.
+## Test
+
+```bash
+uv run pytest -q
+```
+
+## Codex Cloud Environment
+
+Use these settings in Codex cloud environments:
+
+1. Base image: `codex-universal`
+2. Environment variables:
+   - Required: `CODEX_ENV_PYTHON_VERSION=3.12`
+   - Optional: `PYTHONUNBUFFERED=1`
+3. Secrets:
+   - Required: none for this repository as currently implemented
+   - Add only if your fork adds private package registries or external APIs
+4. Setup script: contents of `setup_script.md`
+5. Maintenance script:
+
+```bash
+#!/usr/bin/env bash
+set -euxo pipefail
+uv sync --all-groups --frozen
+```
+
+## Repository Layout
+
+- `dcode_app_factory/`: package modules for models, loops, debate, registry, and utilities
+- `scripts/factory_main.py`: CLI entrypoint
+- `tests/`: pytest suite
+- `SPEC.md`: detailed target specification
+- `tasks.md`: living task list
+- `AGENTS.md`: repository instructions for coding agents
+- `setup_script.md`: copy-paste setup script for Codex cloud UI
+- `.gitignore`: ignore rules for local environments, caches, and test artifacts
+
+## Notes
+
+1. The implementation is intentionally minimal and does not yet implement the full architecture in `SPEC.md`.
+2. The Code Index is currently in-memory and not persisted.
+3. Debate behavior is deterministic and simplified.

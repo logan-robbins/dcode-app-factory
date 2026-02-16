@@ -31,3 +31,22 @@ progresses. Completed items should be annotated with a status mark.
    the debate mechanism. ✅
 9. **Documentation update** – Update `README.md` to reflect the
    current system, installation instructions, and usage. ✅
+
+## Codex Cloud Readiness (2026-02-16)
+
+1. **Dependency management hardening** – Add `pytest` as a managed `uv`
+   dev dependency so `uv run pytest` works in clean environments. ✅
+2. **CLI entrypoint restoration** – Add `scripts/factory_main.py` so the
+   documented launch command exists and runs end-to-end. ✅
+3. **Repository agent guidance** – Add root-level `AGENTS.md` with
+   explicit `uv` workflows and verification commands. ✅
+4. **Cloud setup handoff** – Add `setup_script.md` with copy-paste setup
+   commands for Codex cloud environment bootstrap. ✅
+5. **Documentation refresh** – Rewrite `README.md` to match current
+   commands, environment settings, and Codex cloud setup. ✅
+
+## Repository Hygiene (2026-02-16)
+
+1. **Git ignore baseline** – Add a project-appropriate `.gitignore` for
+   Python, `uv`, test/coverage outputs, caches, editor files, and local
+   env files. ✅
