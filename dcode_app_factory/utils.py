@@ -24,14 +24,9 @@ def load_agent_config(path: Path) -> AgentConfig:
 
 
 def validate_task_dependency_dag(spec: StructuredSpec) -> None:
-    tasks = {}
-    for pillar in spec.pillars:
-        for epic in pillar.epics:
-            for story in epic.stories:
-                for task in story.tasks:
-                    if task.task_id in tasks:
-                        raise ValueError(f"Duplicate task_id: {task.task_id}")
-                    tasks[task.task_id] = task
+    tasks = {task.task_id: task for task in spec.iter_tasks()}
+    if len(tasks) != len(spec.iter_tasks()):
+        raise ValueError("Duplicate task_id detected")
 
     indegree = {task_id: 0 for task_id in tasks}
     outgoing = defaultdict(list)
@@ -56,9 +51,11 @@ def validate_task_dependency_dag(spec: StructuredSpec) -> None:
         raise ValueError("Task dependency graph contains a cycle")
 
 
-def build_context_pack(task_id: str, objective: str, stage: str) -> ContextPack:
+def build_context_pack(task_id: str, objective: str, stage: str, config: AgentConfig) -> ContextPack:
+    budget = max(2000, min(config.max_context_tokens, 16000))
     base_interfaces = [
         "MicroModuleContract",
+        "ShipEvidence",
         "CodeIndex.register(contract)",
         "Debate: propose->challenge->adjudicate",
     ]
@@ -67,5 +64,7 @@ def build_context_pack(task_id: str, objective: str, stage: str) -> ContextPack:
         objective=objective,
         interfaces=base_interfaces,
         allowed_files=[f"state_store/tasks/{task_id}.md", f"state_store/context/{stage}/{task_id}.json"],
-        denied_files=["state_store/code_index/*.json", "**/*.py"],
+        denied_files=["state_store/code_index/*.json", "**/*.py", "**/.env"],
+        context_budget_tokens=budget,
+        required_sections=config.allowed_context_sections,
     )

@@ -1,0 +1,1 @@
+{"stage":"release_loop","role":"release_manager","model_tier":"efficient","temperature":0.0,"max_context_tokens":12000,"context_policy":"immutable_release_manifest","allowed_context_sections":["project_state_snapshot","ship_evidence_bundle","release_manifest_template"]}

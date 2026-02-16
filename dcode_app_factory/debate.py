@@ -24,12 +24,8 @@ class Debate:
 
     def run(self, task_prompt: str, context: ContextPack) -> tuple[DebateResult, DebateTrace]:
         trace = DebateTrace()
-        proposal = self.proposer(task_prompt, context)
-        trace.proposal = proposal
-        challenge = self.challenger(proposal, context)
-        trace.challenge = challenge
-        adjudication = self.arbiter(f"proposal={proposal}\nchallenge={challenge}", context)
-        trace.adjudication = adjudication
-        passed = "pass" in adjudication.lower() and "fail" not in adjudication.lower().split()
-        trace.passed = passed
-        return (DebateResult.PASS if passed else DebateResult.FAIL, trace)
+        trace.proposal = self.proposer(task_prompt, context)
+        trace.challenge = self.challenger(trace.proposal, context)
+        trace.adjudication = self.arbiter(f"proposal={trace.proposal}\nchallenge={trace.challenge}", context).strip().upper()
+        trace.passed = trace.adjudication == "PASS"
+        return (DebateResult.PASS if trace.passed else DebateResult.FAIL, trace)
