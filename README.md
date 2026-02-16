@@ -6,12 +6,34 @@ Contract-first implementation of an AI software product factory with three deter
 - **Project Loop**: validates dependency DAG and dispatches one task at a time.
 - **Engineering Loop**: executes Propose → Challenge → Adjudicate and only ships on PASS.
 
+## Data flow
+
+```
+Raw spec (str) → ProductLoop.run() → StructuredSpec
+StructuredSpec + CodeIndex → ProjectLoop.run() → for each task (topological order):
+  EngineeringLoop.run() → Debate(propose→challenge→adjudicate) → CodeIndex.register(contract)
+```
+
 ## State-of-the-art context engineering updates
 
 - Per-agent configuration files are defined for each stage under `agent_configs/`.
 - Every agent role has explicit context-window limits and an allowed-context policy.
 - Engineering debate uses a task-scoped `ContextPack` with explicit allow/deny file patterns.
 - Task execution is dependency-aware and halts deterministically on failed adjudication.
+
+Agent config JSON schema (`agent_configs/<stage>/<role>.json`):
+
+```json
+{
+  "stage": "product_loop|project_loop|engineering_loop",
+  "role": "string",
+  "model_tier": "string",
+  "temperature": 0.0,
+  "max_context_tokens": 48000,
+  "context_policy": "strict_pack|context_pack_backend|...",
+  "allowed_context_sections": ["list", "of", "strings"]
+}
+```
 
 ## Requirements
 
@@ -80,3 +102,43 @@ uv sync --all-groups --frozen
 - `AGENTS.md`: repository instructions for coding agents
 - `setup_script.md`: copy-paste setup script for Codex cloud UI
 - `.gitignore`: ignore rules for local environments, caches, and test artifacts
+
+## Type hierarchy
+
+- **StructuredSpec** → pillars → epics → stories → tasks
+- **Task**: `task_id`, `depends_on`, `io_contract_sketch`, `status`, `contract` (set after EngineeringLoop)
+- **MicroModuleContract**: `module_id`, `name`, `fingerprint`, inputs/outputs/error_surfaces
+- **ContextPack**: `task_id`, `objective`, `interfaces`, `allowed_files`, `denied_files`
+- **AgentConfig**: `stage`, `role`, `max_context_tokens`, `context_policy`, `allowed_context_sections`
+
+## Extension points
+
+- **New agent role**: add `agent_configs/<stage>/<role>.json`; loops load all `*.json` in the stage dir.
+- **New stage**: add a config dir and pass it to the loop constructor via `config_dir`.
+- **Debate roles**: `_proposer`, `_challenger`, `_arbiter` in `EngineeringLoop`; each receives `(prompt, ContextPack)` and returns a string.
+
+## Fail-fast behavior
+
+- `validate_task_dependency_dag(spec)` raises on cycles or unknown dependencies.
+- `IOContractSketch.validate_complete()` raises if any field contains placeholders (`tbd`, `todo`, `n/a`, etc.).
+- `load_raw_spec()` raises if the requested spec file is missing.
+
+## Implementation state
+
+This is a skeleton. The debate uses placeholder implementations (no LLM calls). Agent configs are loaded but not yet used to invoke models. `build_context_pack()` in `utils.py` constructs `ContextPack`; `allowed_files`/`denied_files` are set but not enforced at runtime.
+
+## Conventions
+
+- Task IDs: `TASK-{index:03d}-{slug}`
+- Slugs: `slugify_name()` → lowercase, hyphens, no consecutive hyphens
+- CodeIndex keys: `slugify_name(contract.name)`
+
+## Quick reference
+
+| Task | Where |
+|------|-------|
+| Add agent role | `agent_configs/<stage>/<role>.json` |
+| Change debate logic | `EngineeringLoop._proposer`, `_challenger`, `_arbiter` in `loops.py` |
+| Change context pack | `build_context_pack()` in `utils.py` |
+| Change spec parsing | `ProductLoop._extract_sections`, `_task_from_section` in `loops.py` |
+| Add/modify contract fields | `models.py` |

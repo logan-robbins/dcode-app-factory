@@ -79,7 +79,7 @@ def main() -> int:
     print(f"project_success={success}")
     print("registered_modules:")
     for slug, contract in code_index.items():
-        print(f"- {slug}: {contract.name}@{contract.version}")
+        print(f"- {slug}: {contract.name} ({contract.module_id})")
 
     return 0 if success else 1
 

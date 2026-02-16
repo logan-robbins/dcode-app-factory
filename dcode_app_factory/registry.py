@@ -39,5 +39,9 @@ class CodeIndex:
     def list_entries(self) -> list[CodeIndexEntry]:
         return list(self._entries.values())
 
+    def items(self) -> list[tuple[str, MicroModuleContract]]:
+        """Return (slug, contract) pairs for iteration."""
+        return [(e.module_slug, e.contract) for e in self._entries.values()]
+
     def __len__(self) -> int:
         return len(self._entries)
