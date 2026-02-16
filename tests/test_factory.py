@@ -1,6 +1,11 @@
-from pathlib import Path
-
-from dcode_app_factory import CodeIndex, ProductLoop, ProjectLoop, slugify_name, to_canonical_json
+from dcode_app_factory import (
+    CodeIndex,
+    ProductLoop,
+    ProjectLoop,
+    get_agent_config_dir,
+    slugify_name,
+    to_canonical_json,
+)
 from dcode_app_factory.models import IOContractSketch, StructuredSpec, TaskStatus
 from dcode_app_factory.utils import load_agent_config, validate_task_dependency_dag
 
@@ -26,7 +31,9 @@ def test_io_contract_sketch_validation() -> None:
 
 
 def test_agent_config_files_load() -> None:
-    config_paths = list(Path("agent_configs").glob("**/*.json"))
+    config_paths = []
+    for stage in ("product_loop", "project_loop", "engineering_loop"):
+        config_paths.extend(get_agent_config_dir(stage).glob("*.json"))
     assert len(config_paths) >= 10
     cfg = load_agent_config(config_paths[0])
     assert cfg.max_context_tokens > 0

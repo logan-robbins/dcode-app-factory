@@ -17,7 +17,7 @@ These instructions are for coding agents working in this repository.
 
 ## Working Rules
 
-1. Prefer extending existing modules in `dcode_app_factory/` over creating parallel implementations.
+1. Prefer extending existing modules in `src/dcode_app_factory/` over creating parallel implementations.
 2. Fail fast with clear errors when required inputs are missing.
 3. Keep docs accurate: if command paths or behaviors change, update `README.md` and `tasks.md` in the same change.
 4. Preserve deterministic behavior in loops and tests.

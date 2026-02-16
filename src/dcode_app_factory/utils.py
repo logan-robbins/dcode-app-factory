@@ -9,6 +9,11 @@ from typing import Any
 from .models import AgentConfig, ContextPack, StructuredSpec
 
 
+def get_agent_config_dir(stage: str) -> Path:
+    """Return the package-relative path to agent configs for a given stage."""
+    return Path(__file__).resolve().parent / "agent_configs" / stage
+
+
 def slugify_name(name: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", name.lower()).strip("-")
     return re.sub(r"-{2,}", "-", slug)

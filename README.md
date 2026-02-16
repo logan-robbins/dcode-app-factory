@@ -16,12 +16,12 @@ StructuredSpec + CodeIndex → ProjectLoop.run() → for each task (topological 
 
 ## State-of-the-art context engineering updates
 
-- Per-agent configuration files are defined for each stage under `agent_configs/`.
+- Per-agent configuration files are bundled in the package under `src/dcode_app_factory/agent_configs/`.
 - Every agent role has explicit context-window limits and an allowed-context policy.
 - Engineering debate uses a task-scoped `ContextPack` with explicit allow/deny file patterns.
 - Task execution is dependency-aware and halts deterministically on failed adjudication.
 
-Agent config JSON schema (`agent_configs/<stage>/<role>.json`):
+Agent config JSON schema (`src/dcode_app_factory/agent_configs/<stage>/<role>.json`):
 
 ```json
 {
@@ -92,11 +92,13 @@ uv sync --all-groups --frozen
 
 ## Layout
 
-- `dcode_app_factory/models.py`: contracts, spec hierarchy, context pack, agent config models
-- `dcode_app_factory/loops.py`: product/project/engineering loop orchestration
-- `dcode_app_factory/debate.py`: 3-agent debate protocol and trace artifact
-- `dcode_app_factory/registry.py`: append-only in-memory code index with contract fingerprints
-- `agent_configs/*/*.json`: agent runtime configs for Product, Project, Engineering stages
+- `src/dcode_app_factory/`: Python package (src layout)
+- `src/dcode_app_factory/models.py`: contracts, spec hierarchy, context pack, agent config models
+- `src/dcode_app_factory/loops.py`: product/project/engineering loop orchestration
+- `src/dcode_app_factory/debate.py`: 3-agent debate protocol and trace artifact
+- `src/dcode_app_factory/registry.py`: append-only in-memory code index with contract fingerprints
+- `src/dcode_app_factory/utils.py`: slugify, context pack builder, agent config loader, DAG validation
+- `src/dcode_app_factory/agent_configs/*/*.json`: agent runtime configs for Product, Project, Engineering stages
 - `scripts/factory_main.py`: CLI entrypoint
 - `tests/`: pytest suite
 - `AGENTS.md`: repository instructions for coding agents
@@ -113,7 +115,7 @@ uv sync --all-groups --frozen
 
 ## Extension points
 
-- **New agent role**: add `agent_configs/<stage>/<role>.json`; loops load all `*.json` in the stage dir.
+- **New agent role**: add `src/dcode_app_factory/agent_configs/<stage>/<role>.json`; loops load all `*.json` in the stage dir.
 - **New stage**: add a config dir and pass it to the loop constructor via `config_dir`.
 - **Debate roles**: `_proposer`, `_challenger`, `_arbiter` in `EngineeringLoop`; each receives `(prompt, ContextPack)` and returns a string.
 
@@ -137,7 +139,7 @@ This is a skeleton. The debate uses placeholder implementations (no LLM calls). 
 
 | Task | Where |
 |------|-------|
-| Add agent role | `agent_configs/<stage>/<role>.json` |
+| Add agent role | `src/dcode_app_factory/agent_configs/<stage>/<role>.json` |
 | Change debate logic | `EngineeringLoop._proposer`, `_challenger`, `_arbiter` in `loops.py` |
 | Change context pack | `build_context_pack()` in `utils.py` |
 | Change spec parsing | `ProductLoop._extract_sections`, `_task_from_section` in `loops.py` |

@@ -9,8 +9,8 @@ progresses. Completed items should be annotated with a status mark.
    appropriate metadata and dependencies and initialise the virtual
    environment using `uv`. ✅
 2. **Directory structure** – Create a Python package under
-   `dcode_app_factory` and submodules for loops, data models, and
-   infrastructure. ✅
+   `src/dcode_app_factory` (src layout) and submodules for loops, data
+   models, and infrastructure. ✅
 3. **Data modelling** – Define data classes (using the standard
    library `dataclasses`) to represent the structured specification
    (pillars, epics, stories, tasks) and micro‑module contracts

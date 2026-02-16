@@ -13,10 +13,7 @@ import sys
 from pathlib import Path
 
 
-# Ensure imports work when the script is executed from scripts/.
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from dcode_app_factory import CodeIndex, ProductLoop, ProjectLoop
 

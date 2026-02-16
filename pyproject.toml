@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "dcode_app_factory"
 version = "0.1.0"
@@ -11,6 +15,12 @@ dependencies = []
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dcode_app_factory = ["agent_configs/**/*.json"]
 
 [dependency-groups]
 dev = [

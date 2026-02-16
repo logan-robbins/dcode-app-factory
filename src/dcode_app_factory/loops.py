@@ -18,7 +18,13 @@ from .models import (
     TaskStatus,
 )
 from .registry import CodeIndex
-from .utils import build_context_pack, load_agent_config, slugify_name, validate_task_dependency_dag
+from .utils import (
+    build_context_pack,
+    get_agent_config_dir,
+    load_agent_config,
+    slugify_name,
+    validate_task_dependency_dag,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +32,9 @@ logger = logging.getLogger(__name__)
 class ProductLoop:
     """Transforms raw markdown spec into structured plan with concrete task contracts."""
 
-    def __init__(self, raw_spec: str, config_dir: str = "agent_configs/product_loop") -> None:
+    def __init__(self, raw_spec: str, config_dir: str | Path | None = None) -> None:
         self.raw_spec = raw_spec
-        self.config_dir = Path(config_dir)
+        self.config_dir = Path(config_dir) if config_dir is not None else get_agent_config_dir("product_loop")
         self.agent_configs = self._load_configs()
 
     def _load_configs(self) -> dict[str, object]:
@@ -111,10 +117,10 @@ class ProductLoop:
 class EngineeringLoop:
     """Runs strict Propose->Challenge->Adjudicate flow for one task."""
 
-    def __init__(self, task: Task, code_index: CodeIndex, config_dir: str = "agent_configs/engineering_loop") -> None:
+    def __init__(self, task: Task, code_index: CodeIndex, config_dir: str | Path | None = None) -> None:
         self.task = task
         self.code_index = code_index
-        self.config_dir = Path(config_dir)
+        self.config_dir = Path(config_dir) if config_dir is not None else get_agent_config_dir("engineering_loop")
         self.agent_configs = {
             path.stem: load_agent_config(path)
             for path in sorted(self.config_dir.glob("*.json"))
@@ -165,10 +171,10 @@ class EngineeringLoop:
 class ProjectLoop:
     """Deterministic task state-machine with dependency-aware dispatch."""
 
-    def __init__(self, spec: StructuredSpec, code_index: CodeIndex | None = None, config_dir: str = "agent_configs/project_loop") -> None:
+    def __init__(self, spec: StructuredSpec, code_index: CodeIndex | None = None, config_dir: str | Path | None = None) -> None:
         self.spec = spec
         self.code_index = code_index if code_index is not None else CodeIndex()
-        self.config_dir = Path(config_dir)
+        self.config_dir = Path(config_dir) if config_dir is not None else get_agent_config_dir("project_loop")
         self.agent_configs = {
             path.stem: load_agent_config(path)
             for path in sorted(self.config_dir.glob("*.json"))

@@ -15,7 +15,7 @@ from .models import (
     TaskStatus,
 )
 from .registry import CodeIndex
-from .utils import slugify_name, to_canonical_json, validate_task_dependency_dag
+from .utils import get_agent_config_dir, slugify_name, to_canonical_json, validate_task_dependency_dag
 
 
 def get_version() -> str:
@@ -27,6 +27,7 @@ def get_version() -> str:
 
 __all__ = [
     "AgentConfig",
+    "get_agent_config_dir",
     "CodeIndex",
     "ContextPack",
     "Debate",
