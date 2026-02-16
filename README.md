@@ -21,6 +21,8 @@ StructuredSpec + CodeIndex → ProjectLoop.run() → for each task (topological 
 - Engineering debate uses a task-scoped `ContextPack` with explicit allow/deny file patterns.
 - Engineering loop records `ShipEvidence` on PASS and `EscalationArtifact` on repeated FAIL.
 - Task execution is dependency-aware, and downstream tasks are marked `blocked` after a failed dependency.
+- Project loop now persists `state_store/state_machine/state.json` with deterministic `declaration_order` and status snapshots.
+- Ship-evidence artifacts are written to `state_store/artifacts/` using an artifact envelope record.
 - Runtime settings can be configured via environment variables for section fan-out, context budgets, and default spec path.
 
 Supported environment variables:
@@ -158,6 +160,8 @@ uv sync --all-groups --frozen
 ## Implementation state
 
 This is a skeleton. The debate uses placeholder implementations (no LLM calls). Agent configs are loaded but not yet used to invoke models. `build_context_pack()` in `utils.py` constructs `ContextPack`; `allowed_files`/`denied_files` are set but not enforced at runtime.
+
+A minimal filesystem-backed state store is now present for Project Loop snapshots and ship-evidence artifacts, but the full SPEC storage/backend architecture is still incomplete.
 
 Contract fingerprinting now uses RFC 8785 canonical JSON serialization before SHA-256 hashing, matching the spec requirement for deterministic canonicalization.
 

@@ -21,6 +21,7 @@ from .models import (
 )
 from .registry import CodeIndex
 from .settings import RuntimeSettings
+from .state_store import ArtifactEnvelope, FilesystemStateStore, ProjectStateMachine, TaskStateEntry
 from .utils import (
     build_context_pack,
     get_agent_config_dir,
@@ -223,15 +224,43 @@ class EngineeringLoop:
 class ProjectLoop:
     """Deterministic task state machine with dependency-aware dispatch."""
 
-    def __init__(self, spec: StructuredSpec, code_index: CodeIndex | None = None, config_dir: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        spec: StructuredSpec,
+        code_index: CodeIndex | None = None,
+        config_dir: str | Path | None = None,
+        state_store_root: str | Path | None = None,
+    ) -> None:
         self.spec = spec
         self.code_index = code_index if code_index is not None else CodeIndex()
         self.config_dir = Path(config_dir) if config_dir is not None else get_agent_config_dir("project_loop")
+        self.state_store = FilesystemStateStore(Path(state_store_root) if state_store_root is not None else Path("state_store"))
         self.agent_configs = {
             path.stem: load_agent_config(path)
             for path in sorted(self.config_dir.glob("*.json"))
         }
         self.role_models = resolve_agent_models(self.agent_configs, RuntimeModelSelection.from_env())
+        self.state_machine = self._build_state_machine()
+        self.state_store.write_state_machine(self.state_machine)
+
+    def _build_state_machine(self) -> ProjectStateMachine:
+        tasks = self._flatten_tasks()
+        return ProjectStateMachine(
+            tasks={task.task_id: TaskStateEntry.from_task(task, idx) for idx, task in enumerate(tasks)}
+        )
+
+    def _set_task_status(self, task: Task, new_status: TaskStatus) -> None:
+        old_status = task.status
+        self.state_machine.assert_valid_transition(task.task_id, old_status, new_status)
+        task.status = new_status
+        entry = self.state_machine.tasks[task.task_id]
+        self.state_machine.tasks[task.task_id] = TaskStateEntry(
+            task_id=entry.task_id,
+            status=new_status.value,
+            depends_on=entry.depends_on,
+            declaration_order=entry.declaration_order,
+        )
+        self.state_store.write_state_machine(self.state_machine)
 
     def _flatten_tasks(self) -> list[Task]:
         return self.spec.iter_tasks()
@@ -269,7 +298,7 @@ class ProjectLoop:
         while queue:
             task = queue.popleft()
             if task.status == TaskStatus.PENDING:
-                task.status = TaskStatus.BLOCKED
+                self._set_task_status(task, TaskStatus.BLOCKED)
             for nxt in children[task.task_id]:
                 queue.append(nxt)
 
@@ -278,10 +307,32 @@ class ProjectLoop:
         tasks = self._topological_order(self._flatten_tasks())
         for task in tasks:
             if any(dep_task.status in {TaskStatus.HALTED, TaskStatus.BLOCKED} for dep_task in tasks if dep_task.task_id in task.depends_on):
-                task.status = TaskStatus.BLOCKED
+                if task.status == TaskStatus.PENDING:
+                    self._set_task_status(task, TaskStatus.BLOCKED)
                 continue
 
             ok = EngineeringLoop(task=task, code_index=self.code_index).run()
+            self.state_machine.tasks[task.task_id] = TaskStateEntry(
+                task_id=task.task_id,
+                status=task.status.value,
+                depends_on=list(task.depends_on),
+                declaration_order=self.state_machine.tasks[task.task_id].declaration_order,
+            )
+            self.state_store.write_state_machine(self.state_machine)
+
+            if task.ship_evidence is not None:
+                envelope = ArtifactEnvelope.build(
+                    artifact_type="ShipEvidence",
+                    artifact_id=f"ship-evidence-{task.task_id.lower()}",
+                    payload={
+                        "task_id": task.ship_evidence.task_id,
+                        "adjudication": task.ship_evidence.adjudication,
+                        "tests_run": task.ship_evidence.tests_run,
+                        "execution_logs": task.ship_evidence.execution_logs,
+                    },
+                )
+                self.state_store.write_artifact(envelope)
+
             if not ok:
                 logger.error("Project halted at %s", task.task_id)
                 self._mark_downstream_blocked(task.task_id)
