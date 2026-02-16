@@ -11,7 +11,7 @@ Contract-first implementation of an AI software product factory with three deter
 ```
 Raw spec (str) → ProductLoop.run() → StructuredSpec
 StructuredSpec + CodeIndex → ProjectLoop.run() → for each task (topological order):
-  EngineeringLoop.run() → Debate(propose→challenge→adjudicate) → CodeIndex.register(contract)
+  EngineeringLoop.run() → Debate(propose→challenge→adjudicate, retries) → CodeIndex.register(contract)
 ```
 
 ## State-of-the-art context engineering updates
@@ -19,7 +19,8 @@ StructuredSpec + CodeIndex → ProjectLoop.run() → for each task (topological 
 - Per-agent configuration files are bundled in the package under `src/dcode_app_factory/agent_configs/`.
 - Every agent role has explicit context-window limits and an allowed-context policy.
 - Engineering debate uses a task-scoped `ContextPack` with explicit allow/deny file patterns.
-- Task execution is dependency-aware and halts deterministically on failed adjudication.
+- Engineering loop records `ShipEvidence` on PASS and `EscalationArtifact` on repeated FAIL.
+- Task execution is dependency-aware, and downstream tasks are marked `blocked` after a failed dependency.
 
 Agent config JSON schema (`src/dcode_app_factory/agent_configs/<stage>/<role>.json`):
 
@@ -99,6 +100,7 @@ uv sync --all-groups --frozen
 - `src/dcode_app_factory/registry.py`: append-only in-memory code index with contract fingerprints
 - `src/dcode_app_factory/utils.py`: slugify, context pack builder, agent config loader, DAG validation
 - `src/dcode_app_factory/agent_configs/*/*.json`: agent runtime configs for Product, Project, Engineering stages
+- `agent_configs/release_loop/*.json`: release-stage config artifacts merged from the remote branch (not yet wired into runtime loops)
 - `scripts/factory_main.py`: CLI entrypoint
 - `tests/`: pytest suite
 - `AGENTS.md`: repository instructions for coding agents
@@ -123,6 +125,8 @@ uv sync --all-groups --frozen
 
 - `validate_task_dependency_dag(spec)` raises on cycles or unknown dependencies.
 - `IOContractSketch.validate_complete()` raises if any field contains placeholders (`tbd`, `todo`, `n/a`, etc.).
+- `EngineeringLoop(..., max_retries=<n>)` raises if `max_retries < 0`.
+- `ProductLoop.run()` raises with explicit validation details when generated specs contain structural errors.
 - `load_raw_spec()` raises if the requested spec file is missing.
 
 ## Implementation state

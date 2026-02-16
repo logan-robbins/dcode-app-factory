@@ -50,3 +50,16 @@ progresses. Completed items should be annotated with a status mark.
 1. **Git ignore baseline** – Add a project-appropriate `.gitignore` for
    Python, `uv`, test/coverage outputs, caches, editor files, and local
    env files. ✅
+
+## Merge `codex/update-code-to-2026-standards` (2026-02-16)
+
+1. **Discover** – Inspect local/remote branch state and identify merge
+   conflict files. ✅
+2. **Plan** – Track conflict-resolution progress in this task list and
+   resolve each conflict with one canonical implementation. ✅
+3. **Implement** – Merge `origin/codex/update-code-to-2026-standards`
+   into `main` and resolve all conflicts without introducing parallel
+   paths. ✅
+4. **Verify** – Run `uv run pytest -q` and confirm no regressions. ✅
+5. **Update** – Refresh `README.md` if behavior/commands changed and
+   finalize task status annotations. ✅
