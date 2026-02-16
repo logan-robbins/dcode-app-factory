@@ -21,6 +21,31 @@ StructuredSpec + CodeIndex → ProjectLoop.run() → for each task (topological 
 - Engineering debate uses a task-scoped `ContextPack` with explicit allow/deny file patterns.
 - Engineering loop records `ShipEvidence` on PASS and `EscalationArtifact` on repeated FAIL.
 - Task execution is dependency-aware, and downstream tasks are marked `blocked` after a failed dependency.
+- Runtime settings can be configured via environment variables for section fan-out, context budgets, and default spec path.
+
+Supported environment variables:
+
+- `FACTORY_MAX_PRODUCT_SECTIONS` (default `8`) — max number of `##` sections converted into tasks.
+- `FACTORY_CONTEXT_BUDGET_FLOOR` (default `2000`) — minimum context budget per invocation.
+- `FACTORY_CONTEXT_BUDGET_CAP` (default `16000`) — maximum context budget per invocation.
+- `FACTORY_DEFAULT_SPEC_PATH` (default `SPEC.md`) — fallback spec path used when `--spec-file` is not provided.
+
+### Default LLM routing (configurable)
+
+Agent configs provide a `model_tier` (`frontier`, `efficient`, `economy`) and runtime resolves these tiers to concrete model IDs.
+
+Current defaults:
+
+- `frontier` → `openai:gpt-5.2`
+- `efficient` → `openai:gpt-5.2-mini`
+- `economy` → `openai:gpt-5.2-nano`
+
+Override with environment variables:
+
+- `FACTORY_MODEL_FRONTIER`
+- `FACTORY_MODEL_EFFICIENT`
+- `FACTORY_MODEL_ECONOMY`
+- `FACTORY_MODEL_ROLE_OVERRIDES_JSON` (JSON object with optional keys of `stage.role` or `role`, e.g. `{"engineering_loop.proposer":"anthropic:claude-sonnet-4.5"}`)
 
 Agent config JSON schema (`src/dcode_app_factory/agent_configs/<stage>/<role>.json`):
 
@@ -40,6 +65,7 @@ Agent config JSON schema (`src/dcode_app_factory/agent_configs/<stage>/<role>.js
 
 1. Python 3.12+
 2. `uv`
+3. Runtime dependency: `rfc8785>=0.1.4` (installed via `uv sync`)
 
 ## Setup
 
@@ -132,6 +158,8 @@ uv sync --all-groups --frozen
 ## Implementation state
 
 This is a skeleton. The debate uses placeholder implementations (no LLM calls). Agent configs are loaded but not yet used to invoke models. `build_context_pack()` in `utils.py` constructs `ContextPack`; `allowed_files`/`denied_files` are set but not enforced at runtime.
+
+Contract fingerprinting now uses RFC 8785 canonical JSON serialization before SHA-256 hashing, matching the spec requirement for deterministic canonicalization.
 
 ## Conventions
 

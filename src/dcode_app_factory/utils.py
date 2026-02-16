@@ -4,9 +4,10 @@ import json
 import re
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import Any
 
+from .canonical import to_canonical_json
 from .models import AgentConfig, ContextPack, StructuredSpec
+from .settings import RuntimeSettings
 
 
 def get_agent_config_dir(stage: str) -> Path:
@@ -17,10 +18,6 @@ def get_agent_config_dir(stage: str) -> Path:
 def slugify_name(name: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", name.lower()).strip("-")
     return re.sub(r"-{2,}", "-", slug)
-
-
-def to_canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def load_agent_config(path: Path) -> AgentConfig:
@@ -56,8 +53,18 @@ def validate_task_dependency_dag(spec: StructuredSpec) -> None:
         raise ValueError("Task dependency graph contains a cycle")
 
 
-def build_context_pack(task_id: str, objective: str, stage: str, config: AgentConfig) -> ContextPack:
-    budget = max(2000, min(config.max_context_tokens, 16000))
+def build_context_pack(
+    task_id: str,
+    objective: str,
+    stage: str,
+    config: AgentConfig,
+    settings: RuntimeSettings | None = None,
+) -> ContextPack:
+    runtime_settings = settings if settings is not None else RuntimeSettings.from_env()
+    budget = max(
+        runtime_settings.context_budget_floor_tokens,
+        min(config.max_context_tokens, runtime_settings.context_budget_cap_tokens),
+    )
     base_interfaces = [
         "MicroModuleContract",
         "ShipEvidence",

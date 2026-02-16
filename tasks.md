@@ -51,6 +51,21 @@ progresses. Completed items should be annotated with a status mark.
    Python, `uv`, test/coverage outputs, caches, editor files, and local
    env files. ✅
 
+## 2026 API and configurability hardening (2026-02-16)
+
+1. **Canonical contract fingerprinting** – Adopt RFC 8785 canonical JSON
+   serialization before SHA-256 hashing for contract fingerprints. ✅
+2. **Runtime settings centralization** – Add environment-driven runtime
+   settings for section fan-out, context budget floor/cap, and default
+   spec path behavior. ✅
+3. **End-to-end validation expansion** – Add robust E2E tests covering
+   CLI execution, configurable default spec selection, and runtime config
+   validation failures. ✅
+4. **Docs synchronization** – Update `README.md` with new settings and
+   dependency details. ✅
+5. **Default LLM configurability** – Add tier-based default model
+   routing with env overrides and tests for role-level selection. ✅
+
 ## Merge `codex/update-code-to-2026-standards` (2026-02-16)
 
 1. **Discover** – Inspect local/remote branch state and identify merge

@@ -1,17 +1,28 @@
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
 from dcode_app_factory import (
     CodeIndex,
+    DEFAULT_MODELS_BY_TIER,
     EngineeringLoop,
     ProductLoop,
     ProjectLoop,
+    RuntimeModelSelection,
     TaskStatus,
     get_agent_config_dir,
     slugify_name,
     to_canonical_json,
 )
 from dcode_app_factory.models import IOContractSketch, StructuredSpec
+from dcode_app_factory.settings import RuntimeSettings
 from dcode_app_factory.utils import build_context_pack, load_agent_config, validate_task_dependency_dag
 
-import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_slugify_name() -> None:
@@ -20,7 +31,9 @@ def test_slugify_name() -> None:
 
 
 def test_canonical_json() -> None:
-    assert to_canonical_json({"b": 2, "a": 1}) == '{"a":1,"b":2}'
+    left = {"b": 2, "a": 1, "nested": {"z": 9, "y": [3, 2, 1]}}
+    right = {"nested": {"y": [3, 2, 1], "z": 9}, "a": 1, "b": 2}
+    assert to_canonical_json(left) == to_canonical_json(right)
 
 
 def test_io_contract_sketch_validation_rejects_placeholders() -> None:
@@ -54,11 +67,58 @@ def test_product_loop_generates_structurally_valid_spec() -> None:
     validate_task_dependency_dag(spec)
 
 
-def test_context_pack_budget_respects_agent_limits() -> None:
+def test_product_loop_section_limit_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FACTORY_MAX_PRODUCT_SECTIONS", "3")
+    raw_spec = "\n".join(["# Product"] + [f"## Section {idx}" for idx in range(1, 8)])
+    spec = ProductLoop(raw_spec).run()
+    assert len(spec.iter_tasks()) == 3
+
+
+def test_runtime_settings_from_env_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FACTORY_CONTEXT_BUDGET_CAP", "7000")
+    monkeypatch.setenv("FACTORY_CONTEXT_BUDGET_FLOOR", "3000")
+    settings = RuntimeSettings.from_env()
+    assert settings.context_budget_cap_tokens == 7000
+    assert settings.context_budget_floor_tokens == 3000
+
+
+def test_runtime_settings_invalid_env_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FACTORY_CONTEXT_BUDGET_CAP", "abc")
+    with pytest.raises(ValueError):
+        RuntimeSettings.from_env()
+
+
+def test_context_pack_budget_respects_agent_and_runtime_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FACTORY_CONTEXT_BUDGET_FLOOR", "2500")
+    monkeypatch.setenv("FACTORY_CONTEXT_BUDGET_CAP", "3500")
     cfg = load_agent_config(get_agent_config_dir("engineering_loop") / "proposer.json")
     context = build_context_pack("TASK-001-a", "test", "engineering_loop", cfg)
-    assert context.context_budget_tokens <= cfg.max_context_tokens
+    assert 2500 <= context.context_budget_tokens <= 3500
     assert "task_contract" in context.required_sections
+
+
+def test_default_models_by_tier_are_exposed() -> None:
+    assert DEFAULT_MODELS_BY_TIER["frontier"]
+    assert DEFAULT_MODELS_BY_TIER["efficient"]
+
+
+def test_runtime_model_selection_tier_and_role_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FACTORY_MODEL_FRONTIER", "openai:gpt-5.2-pro")
+    monkeypatch.setenv(
+        "FACTORY_MODEL_ROLE_OVERRIDES_JSON",
+        '{"engineering_loop.proposer": "anthropic:claude-sonnet-4.5", "arbiter": "openai:gpt-5.2-mini"}',
+    )
+
+    selection = RuntimeModelSelection.from_env()
+    assert selection.resolve("product_loop", "researcher", "frontier") == "openai:gpt-5.2-pro"
+    assert selection.resolve("engineering_loop", "proposer", "frontier") == "anthropic:claude-sonnet-4.5"
+    assert selection.resolve("engineering_loop", "arbiter", "efficient") == "openai:gpt-5.2-mini"
+
+
+def test_runtime_model_selection_invalid_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FACTORY_MODEL_ROLE_OVERRIDES_JSON", "[]")
+    with pytest.raises(ValueError):
+        RuntimeModelSelection.from_env()
 
 
 def test_end_to_end_project_loop_happy_path() -> None:
@@ -104,3 +164,45 @@ def test_project_loop_blocks_downstream_when_engineering_fails() -> None:
         assert second_task.status == TaskStatus.BLOCKED
     finally:
         ProjectLoop.run = original  # type: ignore[method-assign]
+
+
+def test_cli_end_to_end_runs_with_explicit_spec(tmp_path: Path) -> None:
+    spec_file = tmp_path / "tiny_spec.md"
+    spec_file.write_text("# Product\n## A\n## B\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "factory_main.py"),
+            "--spec-file",
+            str(spec_file),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "project_success=True" in result.stdout
+    assert "registered_modules:" in result.stdout
+
+
+def test_cli_uses_configurable_default_spec_path(tmp_path: Path) -> None:
+    spec_file = tmp_path / "custom-default-spec.md"
+    spec_file.write_text("# Product\n## A\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["FACTORY_DEFAULT_SPEC_PATH"] = str(spec_file)
+
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "factory_main.py")],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "project_success=True" in result.stdout
