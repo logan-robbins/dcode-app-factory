@@ -1,0 +1,1 @@
+{"stage":"engineering_loop","role":"micro_planner","model_tier":"frontier","temperature":0.1,"max_context_tokens":32000,"context_policy":"single_task_only","allowed_context_sections":["task_md","io_contract_sketch","code_index_contracts"]}

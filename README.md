@@ -1,13 +1,17 @@
-# dcode_app_factory
+# dcode-app-factory
 
-`dcode_app_factory` is a deterministic skeleton of the AI Software Product
-Factory described in `SPEC.md`.
+Contract-first implementation of an AI software product factory with three deterministic loops:
 
-It currently demonstrates:
+- **Product Loop**: converts a markdown spec into a structured hierarchy (pillar/epic/story/task).
+- **Project Loop**: validates dependency DAG and dispatches one task at a time.
+- **Engineering Loop**: executes Propose → Challenge → Adjudicate and only ships on PASS.
 
-1. Product loop: creates a structured spec placeholder.
-2. Project loop: flattens tasks and dispatches them sequentially.
-3. Engineering loop: runs a propose/challenge/adjudicate flow and registers module contracts.
+## State-of-the-art context engineering updates
+
+- Per-agent configuration files are defined for each stage under `agent_configs/`.
+- Every agent role has explicit context-window limits and an allowed-context policy.
+- Engineering debate uses a task-scoped `ContextPack` with explicit allow/deny file patterns.
+- Task execution is dependency-aware and halts deterministically on failed adjudication.
 
 ## Requirements
 
@@ -28,22 +32,15 @@ uv sync --all-groups
 
 ## Run
 
-Run with auto-loaded `SPEC.md` (if present):
-
 ```bash
 uv run python scripts/factory_main.py
 ```
 
-Run with an explicit spec path:
+Or with an explicit spec path:
 
 ```bash
 uv run python scripts/factory_main.py --spec-file SPEC.md
 ```
-
-The script prints:
-
-1. `project_success=<true|false>`
-2. Registered micro-module contracts from the in-memory Code Index
 
 ## Test
 
@@ -71,19 +68,15 @@ set -euxo pipefail
 uv sync --all-groups --frozen
 ```
 
-## Repository Layout
+## Layout
 
-- `dcode_app_factory/`: package modules for models, loops, debate, registry, and utilities
+- `dcode_app_factory/models.py`: contracts, spec hierarchy, context pack, agent config models
+- `dcode_app_factory/loops.py`: product/project/engineering loop orchestration
+- `dcode_app_factory/debate.py`: 3-agent debate protocol and trace artifact
+- `dcode_app_factory/registry.py`: append-only in-memory code index with contract fingerprints
+- `agent_configs/*/*.json`: agent runtime configs for Product, Project, Engineering stages
 - `scripts/factory_main.py`: CLI entrypoint
 - `tests/`: pytest suite
-- `SPEC.md`: detailed target specification
-- `tasks.md`: living task list
 - `AGENTS.md`: repository instructions for coding agents
 - `setup_script.md`: copy-paste setup script for Codex cloud UI
 - `.gitignore`: ignore rules for local environments, caches, and test artifacts
-
-## Notes
-
-1. The implementation is intentionally minimal and does not yet implement the full architecture in `SPEC.md`.
-2. The Code Index is currently in-memory and not persisted.
-3. Debate behavior is deterministic and simplified.
