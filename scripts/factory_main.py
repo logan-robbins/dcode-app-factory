@@ -1,40 +1,35 @@
-"""Run the skeleton AI software product factory end-to-end.
-
-The script reads raw spec text, runs ProductLoop to build a structured
-spec, executes ProjectLoop (which dispatches EngineeringLoop per task),
-and prints the registered micro-modules from the in-memory CodeIndex.
-"""
+"""Run the AI software product factory end-to-end."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
-import sys
 from pathlib import Path
 
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
-from dcode_app_factory import CodeIndex, ProductLoop, ProjectLoop
+from dcode_app_factory import FactoryOrchestrator
 from dcode_app_factory.settings import RuntimeSettings
 
 
-DEFAULT_SPEC_TEXT = "Placeholder specification for dcode_app_factory."
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SPEC_TEXT = "# Product\n## Factory architecture\n## Project loop\n## Engineering debate\n"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the dcode_app_factory loops")
+    parser = argparse.ArgumentParser(description="Run the dcode_app_factory outer graph")
+    parser.add_argument("--spec-file", type=Path, default=None, help="Optional path to markdown spec input")
     parser.add_argument(
-        "--spec-file",
-        type=Path,
-        default=None,
-        help="Optional path to SPEC.md-style input text.",
+        "--approval-action",
+        default="APPROVE",
+        choices=["APPROVE", "REJECT", "AMEND"],
+        help="Approval gate action used for non-interactive execution",
     )
+    parser.add_argument("--approval-feedback", default=None, help="Optional feedback payload for REJECT/AMEND")
     parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Logging verbosity.",
+        help="Logging verbosity",
     )
     return parser.parse_args()
 
@@ -43,9 +38,7 @@ def load_raw_spec(spec_file: Path | None) -> str:
     settings = RuntimeSettings.from_env()
     if spec_file is not None:
         if not spec_file.is_file():
-            raise FileNotFoundError(
-                f"Requested spec file does not exist: {spec_file}"
-            )
+            raise FileNotFoundError(f"Requested spec file does not exist: {spec_file}")
         return spec_file.read_text(encoding="utf-8")
 
     default_path = settings.default_spec_file(REPO_ROOT)
@@ -68,19 +61,27 @@ def main() -> int:
         logging.error("Unable to load spec text: %s", exc)
         return 1
 
-    product_loop = ProductLoop(raw_spec)
-    structured_spec = product_loop.run()
+    orchestrator = FactoryOrchestrator(raw_spec=raw_spec)
+    try:
+        result = orchestrator.run(
+            approval_action=args.approval_action,
+            approval_feedback=args.approval_feedback,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Factory execution failed: %s", exc)
+        return 1
 
-    code_index = CodeIndex()
-    project_loop = ProjectLoop(structured_spec, code_index)
-    success = project_loop.run()
+    project_success = bool(result.get("project_success", False))
+    print(f"project_success={project_success}")
 
-    print(f"project_success={success}")
-    print("registered_modules:")
-    for slug, contract in code_index.items():
-        print(f"- {slug}: {contract.name} ({contract.module_id})")
+    release_result = result.get("release_result")
+    if release_result is not None:
+        overall = release_result.get("overall_result", "UNKNOWN")
+        print(f"release_result={overall}")
+        print("release_details:")
+        print(json.dumps(release_result, indent=2, default=str))
 
-    return 0 if success else 1
+    return 0 if project_success else 1
 
 
 if __name__ == "__main__":

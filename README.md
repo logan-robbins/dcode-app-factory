@@ -1,73 +1,22 @@
 # dcode-app-factory
 
-Contract-first implementation of an AI software product factory with three deterministic loops:
+LangGraph + deepagents implementation of the AI software product factory defined in `SPEC.md`, including:
 
-- **Product Loop**: converts a markdown spec into a structured hierarchy (pillar/epic/story/task).
-- **Project Loop**: validates dependency DAG and dispatches one task at a time.
-- **Engineering Loop**: executes Propose → Challenge → Adjudicate and only ships on PASS.
-
-## Data flow
-
-```
-Raw spec (str) → ProductLoop.run() → StructuredSpec
-StructuredSpec + CodeIndex → ProjectLoop.run() → for each task (topological order):
-  EngineeringLoop.run() → Debate(propose→challenge→adjudicate, retries) → CodeIndex.register(contract)
-```
-
-## State-of-the-art context engineering updates
-
-- Per-agent configuration files are bundled in the package under `src/dcode_app_factory/agent_configs/`.
-- Every agent role has explicit context-window limits and an allowed-context policy.
-- Engineering debate uses a task-scoped `ContextPack` with explicit allow/deny file patterns.
-- Engineering loop records `ShipEvidence` on PASS and `EscalationArtifact` on repeated FAIL.
-- Task execution is dependency-aware, and downstream tasks are marked `blocked` after a failed dependency.
-- Project loop now persists `state_store/state_machine/state.json` with deterministic `declaration_order` and status snapshots.
-- Ship-evidence artifacts are written to `state_store/artifacts/` using an artifact envelope record.
-- Runtime settings can be configured via environment variables for section fan-out, context budgets, and default spec path.
-
-Supported environment variables:
-
-- `FACTORY_MAX_PRODUCT_SECTIONS` (default `8`) — max number of `##` sections converted into tasks.
-- `FACTORY_CONTEXT_BUDGET_FLOOR` (default `2000`) — minimum context budget per invocation.
-- `FACTORY_CONTEXT_BUDGET_CAP` (default `16000`) — maximum context budget per invocation.
-- `FACTORY_DEFAULT_SPEC_PATH` (default `SPEC.md`) — fallback spec path used when `--spec-file` is not provided.
-
-### Default LLM routing (configurable)
-
-Agent configs provide a `model_tier` (`frontier`, `efficient`, `economy`) and runtime resolves these tiers to concrete model IDs.
-
-Current defaults:
-
-- `frontier` → `openai:gpt-5.2`
-- `efficient` → `openai:gpt-5.2-mini`
-- `economy` → `openai:gpt-5.2-nano`
-
-Override with environment variables:
-
-- `FACTORY_MODEL_FRONTIER`
-- `FACTORY_MODEL_EFFICIENT`
-- `FACTORY_MODEL_ECONOMY`
-- `FACTORY_MODEL_ROLE_OVERRIDES_JSON` (JSON object with optional keys of `stage.role` or `role`, e.g. `{"engineering_loop.proposer":"anthropic:claude-sonnet-4.5"}`)
-
-Agent config JSON schema (`src/dcode_app_factory/agent_configs/<stage>/<role>.json`):
-
-```json
-{
-  "stage": "product_loop|project_loop|engineering_loop",
-  "role": "string",
-  "model_tier": "string",
-  "temperature": 0.0,
-  "max_context_tokens": 48000,
-  "context_policy": "strict_pack|context_pack_backend|...",
-  "allowed_context_sections": ["list", "of", "strings"]
-}
-```
+- Product Loop with structured `ProductSpec` validation and emission
+- Project Loop `StateGraph` dispatch cycle (`init_state_machine -> dispatch -> engineering -> update_state_machine`)
+- Engineering Loop `StateGraph` with `micro_plan` + per-module iteration and nested debate subgraph
+- Debate subgraph routing (`propose -> challenge -> route -> revise/adjudicate -> ship/halt`) using `Command(goto=...)` and parent propagation support
+- Release Loop integration gates (`dependency`, `fingerprint`, `deprecation`, `code_index`)
+- Filesystem state-store with universal artifact envelopes, context-pack persistence, exceptions, escalations, debates, modules, and release manifests
+- Chroma-backed append-only Code Index with OpenAI semantic embeddings by default, metadata filters, lifecycle transitions, and model-change reindex support
+- Backend enforcement wrappers for immutability, opaque implementation access control, and context-pack permissions
+- SQLite checkpointing for outer/project graph execution
 
 ## Requirements
 
 1. Python 3.12+
 2. `uv`
-3. Runtime dependency: `rfc8785>=0.1.4` (installed via `uv sync`)
+3. `OPENAI_API_KEY` set (or present in `.env`)
 
 ## Setup
 
@@ -75,108 +24,125 @@ Agent config JSON schema (`src/dcode_app_factory/agent_configs/<stage>/<role>.js
 uv sync --all-groups --frozen
 ```
 
-If you are initializing locally without an existing lock environment, use:
-
-```bash
-uv sync --all-groups
-```
-
 ## Run
+
+Default run (uses `SPEC.md` unless overridden):
 
 ```bash
 uv run python scripts/factory_main.py
 ```
 
-Or with an explicit spec path:
+Run with explicit spec and non-interactive approval action:
 
 ```bash
-uv run python scripts/factory_main.py --spec-file SPEC.md
+uv run python scripts/factory_main.py \
+  --spec-file /tmp/spec.md \
+  --approval-action APPROVE \
+  --log-level INFO
 ```
 
-## Test
+Run with a project-scoped delivery repository root:
+
+```bash
+FACTORY_PROJECT_ID=ACME-TRADER-SITE uv run python scripts/factory_main.py --spec-file /tmp/spec.md
+```
+
+## Official E2E prompt test
+
+```bash
+cat > /tmp/stock_trader_prompt_spec.md <<'EOF2'
+# Product
+## build a website for stock traders that comapares APIs from major providers and ranks them
+EOF2
+uv run python scripts/factory_main.py --spec-file /tmp/stock_trader_prompt_spec.md --log-level INFO
+```
+
+Expected output includes:
+
+- `project_success=True`
+- `release_result=PASS|FAIL`
+- `release_details` JSON
+
+## Tests
 
 ```bash
 uv run pytest -q
 ```
 
-## Codex Cloud Environment
+## Environment Variables
 
-Use these settings in Codex cloud environments:
+Runtime settings:
 
-1. Base image: `codex-universal`
-2. Environment variables:
-   - Required: `CODEX_ENV_PYTHON_VERSION=3.12`
-   - Optional: `PYTHONUNBUFFERED=1`
-3. Secrets:
-   - Required: none for this repository as currently implemented
-   - Add only if your fork adds private package registries or external APIs
-4. Setup script: contents of `setup_script.md`
-5. Maintenance script:
+- `FACTORY_DEFAULT_SPEC_PATH` (default: `SPEC.md`)
+- `FACTORY_STATE_STORE_ROOT` (default: `state_store`)
+- `FACTORY_PROJECT_ID` (default: `PROJECT-001`; used as project-scoped repository folder name)
+- `FACTORY_MAX_PRODUCT_SECTIONS` (default: `8`)
+- `FACTORY_CONTEXT_BUDGET_FLOOR` (default: `2000`)
+- `FACTORY_CONTEXT_BUDGET_CAP` (default: `16000`)
+- `FACTORY_RECURSION_LIMIT` (default: `1000`)
+- `FACTORY_CHECKPOINT_DB` (default: `state_store/checkpoints/langgraph.sqlite`)
+
+Model routing:
+
+- `FACTORY_MODEL_FRONTIER` (default: `gpt-4o`)
+- `FACTORY_MODEL_EFFICIENT` (default: `gpt-4o-mini`)
+- `FACTORY_MODEL_ECONOMY` (default: `gpt-4o-mini`)
+- `FACTORY_EMBEDDING_MODEL` (default: `text-embedding-3-large`; test-only deterministic override: `deterministic-hash-384`)
+- `FACTORY_DEBATE_USE_LLM` (default: `true`; real model-backed debate path)
+
+Search tooling:
+
+- `TAVILY_API_KEY` (optional; enables `web_search` tool)
+- `SERPAPI_API_KEY` (optional; fallback for `web_search`)
+
+## State Store Layout
+
+Primary directories under `state_store/projects/{project_id}/`:
+
+- `product/` (`spec.json`, `spec.md`)
+- `project/` (`state_machine.json`)
+- `tasks/` (`{task_id}.md`)
+- `artifacts/{artifact_id}/` (`envelope.json`, payload files)
+- `modules/{module_id}/{version}/` (`contract.json`, `examples.md`, `ship.json`, sealed markers)
+- `debates/{artifact_id}/` (`proposal.json`, `challenge.json`, `adjudication.json`)
+- `context_packs/{cp_id}.json`
+- `exceptions/{exception_id}.json`
+- `escalations/{escalation_id}.json`
+- `code_index/` (Chroma persistence)
+- `release/{release_id}.json`
+- `checkpoints/*.sqlite`
+
+## Debugging
+
+Inspect project state:
 
 ```bash
-#!/usr/bin/env bash
-set -euxo pipefail
-uv sync --all-groups --frozen
+cat state_store/projects/PROJECT-001/project/state_machine.json
 ```
 
-## Layout
+Inspect escalations:
 
-- `src/dcode_app_factory/`: Python package (src layout)
-- `src/dcode_app_factory/models.py`: contracts, spec hierarchy, context pack, agent config models
-- `src/dcode_app_factory/loops.py`: product/project/engineering loop orchestration
-- `src/dcode_app_factory/debate.py`: 3-agent debate protocol and trace artifact
-- `src/dcode_app_factory/registry.py`: append-only in-memory code index with contract fingerprints
-- `src/dcode_app_factory/utils.py`: slugify, context pack builder, agent config loader, DAG validation
-- `src/dcode_app_factory/agent_configs/*/*.json`: agent runtime configs for Product, Project, Engineering stages
-- `agent_configs/release_loop/*.json`: release-stage config artifacts merged from the remote branch (not yet wired into runtime loops)
-- `scripts/factory_main.py`: CLI entrypoint
-- `tests/`: pytest suite
-- `AGENTS.md`: repository instructions for coding agents
-- `setup_script.md`: copy-paste setup script for Codex cloud UI
-- `.gitignore`: ignore rules for local environments, caches, and test artifacts
+```bash
+ls -1 state_store/projects/PROJECT-001/escalations
+```
 
-## Type hierarchy
+Inspect debate artifacts:
 
-- **StructuredSpec** → pillars → epics → stories → tasks
-- **Task**: `task_id`, `depends_on`, `io_contract_sketch`, `status`, `contract` (set after EngineeringLoop)
-- **MicroModuleContract**: `module_id`, `name`, `fingerprint`, inputs/outputs/error_surfaces
-- **ContextPack**: `task_id`, `objective`, `interfaces`, `allowed_files`, `denied_files`
-- **AgentConfig**: `stage`, `role`, `max_context_tokens`, `context_policy`, `allowed_context_sections`
+```bash
+find state_store/projects/PROJECT-001/debates -maxdepth 2 -type f
+```
 
-## Extension points
+Inspect release manifests:
 
-- **New agent role**: add `src/dcode_app_factory/agent_configs/<stage>/<role>.json`; loops load all `*.json` in the stage dir.
-- **New stage**: add a config dir and pass it to the loop constructor via `config_dir`.
-- **Debate roles**: `_proposer`, `_challenger`, `_arbiter` in `EngineeringLoop`; each receives `(prompt, ContextPack)` and returns a string.
+```bash
+ls -1 state_store/projects/PROJECT-001/release
+```
 
-## Fail-fast behavior
+## Notes
 
-- `validate_task_dependency_dag(spec)` raises on cycles or unknown dependencies.
-- `IOContractSketch.validate_complete()` raises if any field contains placeholders (`tbd`, `todo`, `n/a`, etc.).
-- `EngineeringLoop(..., max_retries=<n>)` raises if `max_retries < 0`.
-- `ProductLoop.run()` raises with explicit validation details when generated specs contain structural errors.
-- `load_raw_spec()` raises if the requested spec file is missing.
-
-## Implementation state
-
-This is a skeleton. The debate uses placeholder implementations (no LLM calls). Agent configs are loaded but not yet used to invoke models. `build_context_pack()` in `utils.py` constructs `ContextPack`; `allowed_files`/`denied_files` are set but not enforced at runtime.
-
-A minimal filesystem-backed state store is now present for Project Loop snapshots and ship-evidence artifacts, but the full SPEC storage/backend architecture is still incomplete.
-
-Contract fingerprinting now uses RFC 8785 canonical JSON serialization before SHA-256 hashing, matching the spec requirement for deterministic canonicalization.
-
-## Conventions
-
-- Task IDs: `TASK-{index:03d}-{slug}`
-- Slugs: `slugify_name()` → lowercase, hyphens, no consecutive hyphens
-- CodeIndex keys: `slugify_name(contract.name)`
-
-## Quick reference
-
-| Task | Where |
-|------|-------|
-| Add agent role | `src/dcode_app_factory/agent_configs/<stage>/<role>.json` |
-| Change debate logic | `EngineeringLoop._proposer`, `_challenger`, `_arbiter` in `loops.py` |
-| Change context pack | `build_context_pack()` in `utils.py` |
-| Change spec parsing | `ProductLoop._extract_sections`, `_task_from_section` in `loops.py` |
-| Add/modify contract fields | `models.py` |
+- Product Loop uses deepagents (`create_deep_agent`) with integrated tools.
+- Product + Engineering flows enforce reuse-first policy and execute `search_code_index` before create-new decisions.
+- Engineering debate runs model-backed by default with structured output via `function_calling` + `strict=true` to avoid current `json_schema` serializer warnings in the LangChain/OpenAI response path; set `FACTORY_DEBATE_USE_LLM=false` only for deterministic local testing.
+- Engineering contract dependencies are resolved from actual shipped module refs (not hardcoded `@1.0.0`), and release manifests include transitive dependency closure before running release gates.
+- Opaque access-denied errors use the required fixed format defined in SPEC §12.5.
+- Code Index status transitions are one-way (`CURRENT -> DEPRECATED|SUPERSEDED`).

@@ -39,3 +39,6 @@ dist/
 .env
 .env.*
 *.log
+
+# Runtime state snapshots/artifacts
+state_store/

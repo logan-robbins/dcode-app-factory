@@ -8,9 +8,9 @@ from .models import AgentConfig
 
 
 DEFAULT_MODELS_BY_TIER: dict[str, str] = {
-    "frontier": "openai:gpt-5.2",
-    "efficient": "openai:gpt-5.2-mini",
-    "economy": "openai:gpt-5.2-nano",
+    "frontier": "openai:gpt-4o",
+    "efficient": "openai:gpt-4o-mini",
+    "economy": "openai:gpt-4o-mini",
 }
 
 

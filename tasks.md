@@ -85,3 +85,64 @@ progresses. Completed items should be annotated with a status mark.
 2. **Transition guardrails** – Added explicit legal task transition validator for project state-machine status changes. ✅
 3. **Artifact envelope baseline** – Added minimal universal artifact envelope and persisted ship-evidence artifacts under `state_store/artifacts/`. ✅
 4. **Validation coverage** – Added tests for state persistence, artifact output, and illegal transition rejection. ✅
+
+## End-to-end Teams bot prompt validation (2026-02-16)
+
+1. **Discover** – Audit CLI, loops, model routing, and tests for existing end-to-end behavior. ✅
+2. **Plan** – Track the run/fix/verify cycle for the official Teams-bot prompt test. ✅
+3. **Implement** – Execute the app with the official prompt input and fix bugs encountered (`state_store/` git-noise). ✅
+4. **Verify** – Re-ran the prompt command and `uv run pytest -q`; both pass. ✅
+5. **Update** – Synced `README.md` run/debug guidance and finalized task statuses. ✅
+
+## IMPLEMENT.md full execution (2026-02-16)
+
+1. **Phase 1 architecture migration** — LangGraph/deepagents orchestration, backend layering, full state-store schema. ✅
+2. **Phase 2 Product Loop fidelity** — ProductSpec schema, tooling, task-id/slug rules, approval gate. ✅
+3. **Phase 3 Project Loop state machine** — full model, transitions, deterministic dispatch, blocked cascade + re-eval. ✅
+4. **Phase 4 Engineering + debate fidelity** — micro-plan, structured debate artifacts, retry/amendment, per-role context packs, module iteration, escalation schema. ✅
+5. **Phase 5 contracts/artifacts/evidence** — full contract/evidence schemas, universal envelope, immutability. ✅
+6. **Phase 6 context/opaque enforcement** — ContextPackBackend, OpaqueEnforcementBackend, blocked-access errors. ✅
+7. **Phase 7 code index governance** — Chroma-backed index, reuse search/report, lifecycle status, reindex. ✅
+8. **Phase 8 interface-change exceptions** — ICE schema, raise/detect/persist, resolution routing hooks. ✅
+9. **Phase 9 release governance** — release loop integration, deprecation enforcement gates. ✅
+10. **Phase 10 resilience/compliance** — sqlite checkpointing, crash-recovery and isolation tests, recursion/state-key mitigations. ✅
+
+## Production real-debate default and stock-trader E2E validation (2026-02-17)
+
+1. **Discover** — Re-read `IMPLEMENT.md` fully and verify code/docs paths tied to `FACTORY_DEBATE_USE_LLM`. ✅
+2. **Plan** — Add a numbered execution checklist for real-by-default debate and live prompt validation. ✅
+3. **Implement** — Flip runtime default to model-backed debate and align README/test expectations. ✅
+4. **Verify** — Run `uv run pytest -q` and real E2E CLI run using stock-trader prompt with `nohup` + 15s polling; fixed DebateGraph halt propagation retry-loop bug uncovered during live run. ✅
+5. **Update** — Finalize this task section and ensure README reflects the validated production path. ✅
+
+## Project-scoped delivery root (2026-02-17)
+
+1. **Discover** — Trace `project_id` usage and all filesystem write paths across loops/state store/tools. ✅
+2. **Plan** — Route all generated artifacts into a project-id-scoped repository folder under state store. ✅
+3. **Implement** — Add project root scoping helper, wire loops/orchestrator/tools, and preserve compatibility for direct state-store tests. ✅
+4. **Verify** — Update/extend tests for project-root namespacing and run `uv run pytest -q`. ✅
+5. **Update** — Refresh README state-store layout and env variable docs for `FACTORY_PROJECT_ID`. ✅
+
+## Production hardening: vectorization, micro decomposition, prompt/index policy (2026-02-17)
+
+1. **Discover** — Audit vector embedding implementation, micro-plan decomposition granularity, and prompt/index policy enforcement points. ✅
+2. **Plan** — Define one canonical production path: OpenAI semantic embeddings by default, atomic module decomposition, and explicit reuse-first code-index policy in prompts. ✅
+3. **Implement** — Upgrade embedding stack, wire runtime embedding model selection, improve micro-plan decomposition/dependency inference, and strengthen agent prompts/context to require code-index evidence. ✅
+4. **Verify** — Run `uv run pytest -q` plus official stock-trader E2E prompt with `nohup` and 15s polling. ✅
+5. **Update** — Sync `README.md` to reflect embedding defaults, reuse policy behavior, and validation commands. ✅
+
+## Structured-output serializer warning elimination (2026-02-17)
+
+1. **Discover** — Reproduce and trace `PydanticSerializationUnexpectedValue` during live `DebateGraph` structured-output calls. ✅
+2. **Plan** — Define one canonical, warning-free structured-output path and typed normalization boundary in `llm.py`. ✅
+3. **Implement** — Add structured-output adapter/normalizer and switch debate proposer/challenger/arbiter calls to explicit `function_calling + strict`. ✅
+4. **Verify** — Run `uv run pytest -q` and a live model-backed debate invocation with warnings-as-errors checks. ✅
+5. **Update** — Refresh `README.md` notes to reflect the production structured-output method and warning rationale. ✅
+
+## Release gate consistency for mixed-version reuse (2026-02-17)
+
+1. **Discover** — Trace why stock-trader E2E release failed (`dependency_check`/`fingerprint_check`) with mixed `module_ref` versions. ✅
+2. **Plan** — Enforce dependency-ref resolution from actual module refs and expand release set by transitive dependency closure. ✅
+3. **Implement** — Patch EngineeringLoop contract dependency wiring + reuse compatibility checks; patch ReleaseLoop init to include dependency closure. ✅
+4. **Verify** — Run `uv run pytest -q` and rerun stock-trader E2E prompt with 15s polling; validated both first-run and mixed-version rerun release outcomes. ✅
+5. **Update** — Sync README with release-closure behavior and finalize statuses. ✅

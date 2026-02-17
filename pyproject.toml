@@ -5,17 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dcode_app_factory"
 version = "0.1.0"
-description = "A skeleton implementation of an AI software product factory with product, project and engineering loops."
+description = "LangGraph and deepagents implementation of an AI software product factory with product, project, engineering, and release loops."
 requires-python = ">=3.12"
 
-# Runtime dependencies are intentionally empty. This skeleton package
-# uses the Python standard library only.
 dependencies = [
     "chromadb",
     "deepagents",
     "langchain",
+    "langchain-openai>=1.1.9",
     "langgraph",
+    "langgraph-checkpoint-sqlite>=3.0.3",
     "pydantic",
+    "python-dotenv>=1.2.1",
     "rfc8785>=0.1.4",
 ]
 

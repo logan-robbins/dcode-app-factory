@@ -1,225 +1,170 @@
 from __future__ import annotations
 
-import hashlib
 import re
 import uuid
-from dataclasses import dataclass, field
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 from .canonical import to_canonical_json
 
 
-class TaskStatus(str, Enum):
-    PENDING = "pending"
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-    HALTED = "halted"
-    BLOCKED = "blocked"
+SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+TASK_ID_RE = re.compile(r"^(TSK-\d+|T-[a-z0-9-]+-[a-z0-9-]+-[a-z0-9-]+-\d+)$")
 
 
-@dataclass(frozen=True)
-class ValidationIssue:
-    severity: str
-    location: str
+class Severity(StrEnum):
+    ERROR = "ERROR"
+    WARNING = "WARNING"
+
+
+class TaskStatus(StrEnum):
+    PENDING = "PENDING"
+    IN_PROGRESS = "IN_PROGRESS"
+    SHIPPED = "SHIPPED"
+    HALTED = "HALTED"
+    BLOCKED = "BLOCKED"
+    ABANDONED = "ABANDONED"
+
+
+class ArtifactType(StrEnum):
+    MICRO_PLAN = "MICRO_PLAN"
+    CONTRACT = "CONTRACT"
+    IMPLEMENTATION = "IMPLEMENTATION"
+    PROPOSAL = "PROPOSAL"
+    CHALLENGE = "CHALLENGE"
+    ADJUDICATION = "ADJUDICATION"
+    SHIP_EVIDENCE = "SHIP_EVIDENCE"
+    ESCALATION = "ESCALATION"
+    CONTEXT_PACK = "CONTEXT_PACK"
+    INTERFACE_CHANGE_EXCEPTION = "INTERFACE_CHANGE_EXCEPTION"
+    REUSE_SEARCH_REPORT = "REUSE_SEARCH_REPORT"
+    PRODUCT_SPEC = "PRODUCT_SPEC"
+    EXAMPLES = "EXAMPLES"
+
+
+ARTIFACT_TYPE_PREFIX: dict[ArtifactType, str] = {
+    ArtifactType.MICRO_PLAN: "MP",
+    ArtifactType.CONTRACT: "CTR",
+    ArtifactType.IMPLEMENTATION: "IMPL",
+    ArtifactType.PROPOSAL: "PROP",
+    ArtifactType.CHALLENGE: "CHAL",
+    ArtifactType.ADJUDICATION: "ADJ",
+    ArtifactType.SHIP_EVIDENCE: "SHIP",
+    ArtifactType.ESCALATION: "ESC",
+    ArtifactType.CONTEXT_PACK: "CP",
+    ArtifactType.INTERFACE_CHANGE_EXCEPTION: "ICE",
+    ArtifactType.REUSE_SEARCH_REPORT: "RSR",
+    ArtifactType.PRODUCT_SPEC: "SPEC",
+    ArtifactType.EXAMPLES: "EX",
+}
+
+
+class ArtifactStatus(StrEnum):
+    DRAFT = "DRAFT"
+    CHALLENGED = "CHALLENGED"
+    ADJUDICATED = "ADJUDICATED"
+    SHIPPED = "SHIPPED"
+    DEPRECATED = "DEPRECATED"
+
+
+ARTIFACT_STATUS_TRANSITIONS: dict[ArtifactStatus, set[ArtifactStatus]] = {
+    ArtifactStatus.DRAFT: {ArtifactStatus.CHALLENGED},
+    ArtifactStatus.CHALLENGED: {ArtifactStatus.ADJUDICATED},
+    ArtifactStatus.ADJUDICATED: {ArtifactStatus.SHIPPED, ArtifactStatus.DRAFT},
+    ArtifactStatus.SHIPPED: {ArtifactStatus.DEPRECATED},
+    ArtifactStatus.DEPRECATED: set(),
+}
+
+
+class CodeIndexStatus(StrEnum):
+    CURRENT = "CURRENT"
+    DEPRECATED = "DEPRECATED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+class DebateVerdict(StrEnum):
+    PASS = "PASS"
+    FAIL = "FAIL"
+
+
+class AdjudicationDecision(StrEnum):
+    APPROVE = "APPROVE"
+    APPROVE_WITH_AMENDMENTS = "APPROVE_WITH_AMENDMENTS"
+    REJECT = "REJECT"
+
+
+class ShipDirective(StrEnum):
+    SHIP = "SHIP"
+    NO_SHIP = "NO_SHIP"
+
+
+class ReuseDecision(StrEnum):
+    REUSE = "REUSE"
+    CREATE_NEW = "CREATE_NEW"
+
+
+class ReuseConclusion(StrEnum):
+    REUSE_EXISTING = "REUSE_EXISTING"
+    CREATE_NEW = "CREATE_NEW"
+
+
+class ContextAccessLevel(StrEnum):
+    FULL = "FULL"
+    CONTRACT_ONLY = "CONTRACT_ONLY"
+    SUMMARY_ONLY = "SUMMARY_ONLY"
+    METADATA_ONLY = "METADATA_ONLY"
+
+
+class InterfaceChangeType(StrEnum):
+    CANNOT_SUPPORT = "CANNOT_SUPPORT"
+    AMBIGUOUS = "AMBIGUOUS"
+    INCOMPLETE = "INCOMPLETE"
+    MISSING_DIMENSION = "MISSING_DIMENSION"
+
+
+class CompatibilityExpectation(StrEnum):
+    BACKWARD_COMPATIBLE = "BACKWARD_COMPATIBLE"
+    BREAKING = "BREAKING"
+    UNKNOWN = "UNKNOWN"
+
+
+class Urgency(StrEnum):
+    BLOCKING = "BLOCKING"
+    HIGH = "HIGH"
+    NORMAL = "NORMAL"
+    LOW = "LOW"
+
+
+class HumanResolutionAction(StrEnum):
+    APPROVE_OVERRIDE = "APPROVE_OVERRIDE"
+    AMEND_SPEC = "AMEND_SPEC"
+    SPLIT_TASK = "SPLIT_TASK"
+    REVISE_PLAN = "REVISE_PLAN"
+    PROVIDE_FIX = "PROVIDE_FIX"
+    ABANDON_TASK = "ABANDON_TASK"
+
+
+class ValidationIssue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    severity: Severity
+    path: str
+    field: str
     message: str
 
 
-@dataclass(frozen=True)
-class IOContractSketch:
-    """Contract sketch required at Product Loop stage."""
+class ValidationReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
-    inputs: list[str]
-    outputs: list[str]
-    error_surfaces: list[str]
-    effects: list[str]
-    modes: list[str]
-
-    def validate_complete(self) -> None:
-        fields = {
-            "inputs": self.inputs,
-            "outputs": self.outputs,
-            "error_surfaces": self.error_surfaces,
-            "effects": self.effects,
-            "modes": self.modes,
-        }
-        placeholders = {"tbd", "todo", "n/a", "na", "none"}
-        for field_name, values in fields.items():
-            if not values:
-                raise ValueError(f"io_contract_sketch.{field_name} cannot be empty")
-            lowered = {value.strip().lower() for value in values if value.strip()}
-            if lowered & placeholders:
-                raise ValueError(f"io_contract_sketch.{field_name} contains placeholders")
+    errors: list[ValidationIssue] = Field(default_factory=list)
+    warnings: list[ValidationIssue] = Field(default_factory=list)
 
 
-@dataclass(frozen=True)
-class MicroModuleContract:
-    """Final micro-module contract used by Engineering Loop."""
-
-    module_id: str
-    name: str
-    description: str
-    inputs: list[dict[str, str]]
-    outputs: list[dict[str, str]]
-    error_surfaces: list[dict[str, str]]
-    effects: list[str]
-    modes: list[str]
-    depends_on: list[str] = field(default_factory=list)
-
-    @property
-    def fingerprint(self) -> str:
-        payload = {
-            "module_id": self.module_id,
-            "name": self.name,
-            "description": self.description,
-            "inputs": self.inputs,
-            "outputs": self.outputs,
-            "error_surfaces": self.error_surfaces,
-            "effects": self.effects,
-            "modes": self.modes,
-            "depends_on": self.depends_on,
-        }
-        canonical = to_canonical_json(payload)
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-@dataclass(frozen=True)
-class ShipEvidence:
-    task_id: str
-    adjudication: str
-    tests_run: list[str]
-    execution_logs: list[str]
-
-
-@dataclass
-class Task:
-    task_id: str
-    name: str
-    description: str
-    subtasks: list[str]
-    acceptance_criteria: list[str]
-    io_contract_sketch: IOContractSketch
-    depends_on: list[str] = field(default_factory=list)
-    status: TaskStatus = TaskStatus.PENDING
-    contract: MicroModuleContract | None = None
-    ship_evidence: ShipEvidence | None = None
-
-
-@dataclass
-class Story:
-    story_id: str
-    name: str
-    description: str
-    user_facing_behavior: str
-    tasks: list[Task]
-
-
-@dataclass
-class Epic:
-    epic_id: str
-    name: str
-    description: str
-    success_criteria: list[str]
-    stories: list[Story]
-
-
-@dataclass
-class Pillar:
-    pillar_id: str
-    name: str
-    description: str
-    rationale: str
-    epics: list[Epic]
-
-
-@dataclass
-class StructuredSpec:
-    product_name: str
-    vision: str
-    constraints: list[str]
-    pillars: list[Pillar]
-    version: str = "2026.1"
-
-    def iter_tasks(self) -> list[Task]:
-        return [
-            task
-            for pillar in self.pillars
-            for epic in pillar.epics
-            for story in epic.stories
-            for task in story.tasks
-        ]
-
-    def validate(self) -> list[ValidationIssue]:
-        issues: list[ValidationIssue] = []
-        task_ids: set[str] = set()
-        verbs = re.compile(r"\b(returns|displays|raises|writes|emits|rejects|validates|produces|creates)\b", re.IGNORECASE)
-
-        if not self.pillars:
-            issues.append(ValidationIssue("ERROR", "pillars", "Spec must include at least one pillar"))
-
-        for p_idx, pillar in enumerate(self.pillars):
-            p_loc = f"pillars[{p_idx}]"
-            if not pillar.epics:
-                issues.append(ValidationIssue("ERROR", p_loc, "Every pillar must have at least one epic"))
-            for field_name in ("pillar_id", "name", "description", "rationale"):
-                if not getattr(pillar, field_name).strip():
-                    issues.append(ValidationIssue("ERROR", p_loc, f"{field_name} must be non-empty"))
-
-            for e_idx, epic in enumerate(pillar.epics):
-                e_loc = f"{p_loc}.epics[{e_idx}]"
-                if not epic.stories:
-                    issues.append(ValidationIssue("ERROR", e_loc, "Every epic must have at least one story"))
-                if not epic.success_criteria:
-                    issues.append(ValidationIssue("ERROR", e_loc, "Every epic must have at least one success criterion"))
-                for s_idx, story in enumerate(epic.stories):
-                    s_loc = f"{e_loc}.stories[{s_idx}]"
-                    if not story.tasks:
-                        issues.append(ValidationIssue("ERROR", s_loc, "Every story must have at least one task"))
-                    for t_idx, task in enumerate(story.tasks):
-                        t_loc = f"{s_loc}.tasks[{t_idx}]"
-                        if task.task_id in task_ids:
-                            issues.append(ValidationIssue("ERROR", t_loc, f"Duplicate task_id {task.task_id}"))
-                        task_ids.add(task.task_id)
-                        if len(task.subtasks) < 2:
-                            issues.append(ValidationIssue("ERROR", t_loc, "Task requires at least two subtasks"))
-                        if len(task.acceptance_criteria) < 2:
-                            issues.append(ValidationIssue("ERROR", t_loc, "Task requires at least two acceptance criteria"))
-                        if len({s.lower().strip() for s in task.subtasks}) != len(task.subtasks):
-                            issues.append(ValidationIssue("WARNING", t_loc, "Subtasks appear duplicated"))
-                        for criterion in task.acceptance_criteria:
-                            if not verbs.search(criterion):
-                                issues.append(ValidationIssue("WARNING", t_loc, f"Non-testable acceptance criterion: {criterion}"))
-                        if not task.io_contract_sketch.error_surfaces:
-                            issues.append(ValidationIssue("WARNING", t_loc, "error_surfaces should contain specific error conditions"))
-                        try:
-                            task.io_contract_sketch.validate_complete()
-                        except ValueError as exc:
-                            issues.append(ValidationIssue("ERROR", t_loc, str(exc)))
-
-        by_id = {task.task_id: task for task in self.iter_tasks()}
-        for task in self.iter_tasks():
-            for dep in task.depends_on:
-                if dep not in by_id:
-                    issues.append(ValidationIssue("ERROR", task.task_id, f"depends_on references unknown task {dep}"))
-
-        return issues
-
-
-@dataclass(frozen=True)
-class ContextPack:
-    """Deterministic context pack for one agent invocation."""
-
-    task_id: str
-    objective: str
-    interfaces: list[str]
-    allowed_files: list[str]
-    denied_files: list[str]
-    context_budget_tokens: int
-    required_sections: list[str]
-
-
-@dataclass(frozen=True)
-class AgentConfig:
-    """Runtime config for one agent role."""
+class AgentConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
     stage: str
     role: str
@@ -230,17 +175,716 @@ class AgentConfig:
     allowed_context_sections: list[str]
 
 
-@dataclass
-class DebateTrace:
-    trace_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    proposal: str = ""
-    challenge: str = ""
-    adjudication: str = ""
-    passed: bool = False
+class IOContractSketch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    inputs: str
+    outputs: str
+    error_surfaces: str
+    effects: str
+    modes: str
+
+    @model_validator(mode="after")
+    def validate_non_empty(self) -> "IOContractSketch":
+        placeholders = {"tbd", "todo", "n/a", "na", "none", "placeholder"}
+        for key in ("inputs", "outputs", "error_surfaces", "effects", "modes"):
+            value = getattr(self, key).strip()
+            if not value:
+                raise ValueError(f"io_contract_sketch.{key} must be non-empty")
+            if value.lower() in placeholders:
+                raise ValueError(f"io_contract_sketch.{key} cannot be placeholder text")
+        return self
 
 
-@dataclass(frozen=True)
-class EscalationArtifact:
+class Task(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     task_id: str
+    name: str
+    description: str
+    subtasks: list[str] = Field(min_length=2)
+    acceptance_criteria: list[str] = Field(min_length=2)
+    depends_on: list[str] = Field(default_factory=list)
+    io_contract_sketch: IOContractSketch
+
+    @field_validator("task_id")
+    @classmethod
+    def validate_task_id(cls, value: str) -> str:
+        if not TASK_ID_RE.match(value):
+            raise ValueError("task_id must match TSK-NNN or T-{pillar}-{epic}-{story}-{seq}")
+        return value
+
+    @model_validator(mode="after")
+    def validate_required(self) -> "Task":
+        if len({s.strip().lower() for s in self.subtasks}) != len(self.subtasks):
+            raise ValueError("subtasks must be semantically distinct")
+        return self
+
+
+class Story(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    story_id: str = Field(pattern=r"^STR-\d+$")
+    name: str
+    description: str
+    user_facing_behavior: str
+    tasks: list[Task] = Field(min_length=1)
+
+
+class Epic(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    epic_id: str = Field(pattern=r"^EPC-\d+$")
+    name: str
+    description: str
+    success_criteria: list[str] = Field(min_length=1)
+    stories: list[Story] = Field(min_length=1)
+
+
+class Pillar(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pillar_id: str = Field(pattern=r"^PIL-\d+$")
+    name: str
+    description: str
+    rationale: str
+    epics: list[Epic] = Field(min_length=1)
+
+
+class ProductSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    spec_id: str = Field(pattern=r"^SPEC-\d+$")
+    spec_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+    title: str
+    description: str
+    created_at: datetime
+    updated_at: datetime
+    pillars: list[Pillar] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_task_uniqueness(self) -> "ProductSpec":
+        tasks = self.iter_tasks()
+        ids = [task.task_id for task in tasks]
+        if len(ids) != len(set(ids)):
+            raise ValueError("task_id values must be globally unique")
+        by_id = {task.task_id for task in tasks}
+        for task in tasks:
+            for dep in task.depends_on:
+                if dep not in by_id:
+                    raise ValueError(f"task {task.task_id} depends_on unknown task {dep}")
+        return self
+
+    def iter_tasks(self) -> list[Task]:
+        return [
+            task
+            for pillar in self.pillars
+            for epic in pillar.epics
+            for story in epic.stories
+            for task in story.tasks
+        ]
+
+
+class StructuredSpec(ProductSpec):
+    """Backward-compatible alias used by prior code paths."""
+
+
+class ProjectTaskState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pillar: str
+    epic: str
+    story: str
+    task: str
+    status: TaskStatus
+    depends_on: list[str] = Field(default_factory=list)
+    module_ref: str | None = None
+    module_refs: list[str] = Field(default_factory=list)
+    shipped_at: datetime | None = None
+    halted_reason: str | None = None
+    escalation_ref: str | None = None
+    declaration_order: int = Field(ge=0)
+
+
+PROJECT_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
+    TaskStatus.PENDING: {TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED},
+    TaskStatus.IN_PROGRESS: {TaskStatus.SHIPPED, TaskStatus.HALTED},
+    TaskStatus.BLOCKED: {TaskStatus.PENDING},
+    TaskStatus.HALTED: {TaskStatus.PENDING, TaskStatus.ABANDONED, TaskStatus.SHIPPED},
+    TaskStatus.SHIPPED: set(),
+    TaskStatus.ABANDONED: set(),
+}
+
+
+class ProjectState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    spec_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+    updated_at: datetime
+    tasks: dict[str, ProjectTaskState]
+
+    def transition(self, task_id: str, to_status: TaskStatus) -> None:
+        task = self.tasks[task_id]
+        if to_status not in PROJECT_TRANSITIONS[task.status]:
+            raise ValueError(
+                f"Illegal task status transition for {task_id}: {task.status.value} -> {to_status.value}"
+            )
+        task.status = to_status
+        self.updated_at = datetime.now(UTC)
+
+
+class ContextPermission(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    access_level: ContextAccessLevel
+
+
+class ContextPack(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cp_id: str = Field(pattern=r"^CP-[0-9a-f]{8}$")
+    task_id: str
+    role: str
+    objective: str
+    permissions: list[ContextPermission]
+    context_budget_tokens: int = Field(ge=256)
+    required_sections: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    def access_for_path(self, path: str) -> ContextAccessLevel:
+        normalized = path.rstrip("/")
+        for permission in self.permissions:
+            allowed = permission.path.rstrip("/")
+            if normalized == allowed or normalized.startswith(f"{allowed}/"):
+                return permission.access_level
+        return ContextAccessLevel.CONTRACT_ONLY
+
+
+class ContractInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    type: str
+    constraints: list[str] = Field(default_factory=list)
+
+
+class ContractOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    type: str
+    invariants: list[str] = Field(default_factory=list)
+
+
+class ContractErrorSurface(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    when: str
+    surface: str
+
+
+class EffectType(StrEnum):
+    POST = "POST"
+    PUT = "PUT"
+    PATCH = "PATCH"
+    WRITE = "WRITE"
+    CALL = "CALL"
+    MUTATION = "MUTATION"
+
+
+class ContractEffect(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: EffectType
+    target: str
+    description: str
+
+
+class ContractModes(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sync: bool
+    async_mode: bool = Field(alias="async")
+    notes: str
+
+
+class DependencyRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ref: str
+    why: str
+
+    @field_validator("ref")
+    @classmethod
+    def validate_ref(cls, value: str) -> str:
+        if "@" not in value:
+            raise ValueError("dependency ref must be ModuleRef format MM-...@x.y.z")
+        return value
+
+
+class CompatibilityRule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    backward_compatible_with: list[str] = Field(default_factory=list)
+    breaking_change_policy: str
+
+
+class RuntimeBudgets(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    latency_ms_p95: float | None = None
+    memory_mb_max: float | None = None
+
+
+class MicroModuleContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    module_id: str = Field(pattern=r"^MM-[a-zA-Z0-9-]+$")
+    module_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+    name: str
+    purpose: str
+    tags: list[str] = Field(default_factory=list)
+    examples_ref: str
+    status: ArtifactStatus = ArtifactStatus.DRAFT
+    created_by: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    supersedes: str | None = None
+    deprecated_by: str | None = None
+    inputs: list[ContractInput] = Field(min_length=1)
+    outputs: list[ContractOutput] = Field(min_length=1)
+    error_surfaces: list[ContractErrorSurface] = Field(min_length=1)
+    effects: list[ContractEffect] = Field(default_factory=list)
+    modes: ContractModes
+    error_cases: list[str] = Field(default_factory=list)
+    dependencies: list[DependencyRef] = Field(default_factory=list)
+    compatibility: CompatibilityRule
+    runtime_budgets: RuntimeBudgets = Field(default_factory=RuntimeBudgets)
+
+    @computed_field(return_type=str)
+    @property
+    def interface_fingerprint(self) -> str:
+        payload = {
+            "inputs": [entry.model_dump(mode="json") for entry in self.inputs],
+            "outputs": [entry.model_dump(mode="json") for entry in self.outputs],
+            "error_surfaces": [entry.model_dump(mode="json") for entry in self.error_surfaces],
+            "effects": [entry.model_dump(mode="json") for entry in self.effects],
+            "modes": self.modes.model_dump(by_alias=True, mode="json"),
+        }
+        canonical = to_canonical_json(payload)
+        import hashlib
+
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class ShipVerification(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    result: Literal["PASS", "FAIL"]
+    interface_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evidence_ref: str
+
+
+class ShipEnvironment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repo_revision: str
+    dependency_lock_ref: str
+    runner_id: str
+
+
+class ShipEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    module_id: str
+    module_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+    ship_id: str = Field(pattern=r"^SHIP-[0-9a-f]{8}$")
+    verified_at: datetime
+    verification: ShipVerification
+    environment: ShipEnvironment
+    test_artifact_refs: list[str] = Field(default_factory=list)
+    coverage_report_ref: str | None = None
+    ship_time: datetime
+
+
+class CodeIndexIoSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    inputs: list[str]
+    outputs: list[str]
+    error_surfaces: list[str]
+    effects: list[str]
+    modes: list[str]
+
+
+class CodeIndexEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    module_ref: str
+    module_id: str
+    version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+    name: str
+    purpose: str
+    tags: list[str] = Field(default_factory=list)
+    contract_ref: str
+    examples_ref: str
+    ship_ref: str
+    io_summary: CodeIndexIoSummary
+    dependencies: list[str] = Field(default_factory=list)
+    status: CodeIndexStatus = CodeIndexStatus.CURRENT
+    superseded_by: str | None = None
+    deprecation_reason: str | None = None
+    notes: str = ""
+
+
+class ReuseSearchCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    module_ref: str
+    why_rejected: str
+
+
+class ReuseSearchReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+    candidates_considered: list[ReuseSearchCandidate] = Field(default_factory=list)
+    conclusion: ReuseConclusion
+    justification: str
+
+    @model_validator(mode="after")
+    def validate_create_new_justification(self) -> "ReuseSearchReport":
+        if self.conclusion == ReuseConclusion.CREATE_NEW and not self.justification.strip():
+            raise ValueError("CREATE_NEW requires a non-empty justification")
+        return self
+
+
+class MicroIoContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    inputs: list[str] = Field(min_length=1)
+    outputs: list[str] = Field(min_length=1)
+    error_surfaces: list[str] = Field(default_factory=list)
+    effects: list[str] = Field(default_factory=list)
+    modes: list[str] = Field(default_factory=list)
+
+
+class MicroPlanModule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    module_id: str = Field(pattern=r"^MM-[a-zA-Z0-9-]+$")
+    name: str
+    purpose: str
+    io_contract: MicroIoContract
+    error_cases: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)
+    reuse_candidate_refs: list[str] = Field(default_factory=list)
+    reuse_decision: ReuseDecision
+    reuse_justification: str
+    reuse_search_report: ReuseSearchReport
+
+
+class MicroPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    micro_plan_id: str = Field(pattern=r"^MP-[0-9a-f]{8}$")
+    parent_task_ref: str
+    modules: list[MicroPlanModule] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_structure(self) -> "MicroPlan":
+        ids = [module.module_id for module in self.modules]
+        if len(ids) != len(set(ids)):
+            raise ValueError("micro plan module_id values must be unique")
+
+        known = set(ids)
+        incoming: dict[str, int] = {module.module_id: 0 for module in self.modules}
+        edges: dict[str, list[str]] = {module.module_id: [] for module in self.modules}
+        for module in self.modules:
+            for dep in module.depends_on:
+                if dep not in known:
+                    if not dep.startswith("MM-"):
+                        raise ValueError(f"invalid depends_on reference: {dep}")
+                    continue
+                incoming[module.module_id] += 1
+                edges[dep].append(module.module_id)
+
+        queue = [module.module_id for module in self.modules if incoming[module.module_id] == 0]
+        seen = 0
+        while queue:
+            current = queue.pop(0)
+            seen += 1
+            for nxt in edges[current]:
+                incoming[nxt] -= 1
+                if incoming[nxt] == 0:
+                    queue.append(nxt)
+        if seen != len(self.modules):
+            raise ValueError("micro plan depends_on graph contains a cycle")
+        return self
+
+
+class Proposal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    proposal_id: str = Field(pattern=r"^PROP-[0-9a-f]{8}$")
+    target_artifact_id: str
+    claim: str
+    deliverable_ref: str
+    acceptance_checks: list[str] = Field(min_length=1)
+
+
+class ChallengeFailure(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    invariant: str
+    evidence: str
+    required_change: str
+
+
+class RubricAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    criterion: Literal["R1", "R2", "R3", "R4", "R5", "R6"]
+    assessment: Literal["MET", "NOT_MET"]
+    evidence: str
+
+
+class Challenge(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    challenge_id: str = Field(pattern=r"^CHAL-[0-9a-f]{8}$")
+    target_artifact_id: str
+    verdict: DebateVerdict
+    failures: list[ChallengeFailure] = Field(default_factory=list)
+    optional_alternative_ref: str | None = None
+    rubric_assessments: list[RubricAssessment] = Field(min_length=6, max_length=6)
+
+    @model_validator(mode="after")
+    def validate_rubric(self) -> "Challenge":
+        criteria = {entry.criterion for entry in self.rubric_assessments}
+        if criteria != {"R1", "R2", "R3", "R4", "R5", "R6"}:
+            raise ValueError("rubric_assessments must include exactly R1..R6")
+        has_not_met = any(entry.assessment == "NOT_MET" for entry in self.rubric_assessments)
+        if has_not_met and self.verdict != DebateVerdict.FAIL:
+            raise ValueError("challenge verdict must be FAIL when any rubric assessment is NOT_MET")
+        return self
+
+
+class AmendmentAction(StrEnum):
+    MODIFY = "MODIFY"
+    ADD = "ADD"
+    REMOVE = "REMOVE"
+
+
+class AdjudicationAmendment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: AmendmentAction
+    target: str
+    detail: str
+
+
+class Adjudication(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    adjudication_id: str = Field(pattern=r"^ADJ-[0-9a-f]{8}$")
+    target_artifact_id: str
+    decision: AdjudicationDecision
+    amendments: list[AdjudicationAmendment] = Field(default_factory=list)
+    rationale: str
+    ship_directive: ShipDirective
+
+
+class DebateTrail(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    proposals: list[str] = Field(default_factory=list)
+    challenges: list[str] = Field(default_factory=list)
+    adjudications: list[str] = Field(default_factory=list)
+
+
+class FailedInvariant(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    invariant: str
+    evidence: str
+
+
+class EscalationArtifact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    escalation_id: str = Field(pattern=r"^ESC-[0-9a-f]{8}$")
+    task_id: str
+    task_ref: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    debate_trail: DebateTrail
+    failed_invariants: list[FailedInvariant] = Field(default_factory=list)
+    state_machine_snapshot: dict[str, Any]
+    minimal_decision_required: str
+    recommended_resolution: HumanResolutionAction
+    resolution_context: str
+    failure_root_cause: str
+    retries_exhausted: int = Field(ge=0)
+    context_pack_refs: list[str] = Field(default_factory=list)
+    debate_artifact_refs: list[str] = Field(default_factory=list)
+
+
+class RaisedBy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_ref: str
+    role: str
+    run_id: str
+
+
+class ProposedContractDelta(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    added_inputs: list[dict[str, Any]] = Field(default_factory=list)
+    removed_inputs: list[dict[str, Any]] = Field(default_factory=list)
+    modified_inputs: list[dict[str, Any]] = Field(default_factory=list)
+    added_outputs: list[dict[str, Any]] = Field(default_factory=list)
+    removed_outputs: list[dict[str, Any]] = Field(default_factory=list)
+    modified_outputs: list[dict[str, Any]] = Field(default_factory=list)
+    added_error_surfaces: list[dict[str, Any]] = Field(default_factory=list)
+    added_effects: list[dict[str, Any]] = Field(default_factory=list)
+    mode_changes: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def validate_has_change(self) -> "ProposedContractDelta":
+        values = self.model_dump()
+        has_change = any(bool(value) for value in values.values())
+        if not has_change:
+            raise ValueError("proposed_contract_delta must include at least one change")
+        return self
+
+
+class InterfaceChangeException(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    exception_id: str = Field(pattern=r"^ICE-[0-9a-f]{8}$")
+    type: InterfaceChangeType
+    raised_by: RaisedBy
+    target_module: str
     reason: str
-    debate_trace: DebateTrace
+    evidence: list[str] = Field(min_length=1)
+    proposed_contract_delta: ProposedContractDelta
+    compatibility_expectation: CompatibilityExpectation
+    urgency: Urgency
+
+
+class ActorRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: str
+    run_id: str
+
+
+class ArtifactRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ref: str
+    purpose: str
+
+
+class ArtifactEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: str = Field(pattern=r"^(MP|CTR|IMPL|PROP|CHAL|ADJ|SHIP|ESC|CP|ICE|RSR|SPEC|EX)-[0-9a-f]{8}$")
+    artifact_type: ArtifactType
+    version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+    status: ArtifactStatus
+    created_at: datetime
+    created_by: ActorRef
+    context_pack_ref: str
+    inputs: list[ArtifactRef] = Field(default_factory=list)
+    outputs: list[ArtifactRef] = Field(default_factory=list)
+    notes: str = ""
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def build(
+        cls,
+        artifact_type: ArtifactType,
+        created_by: ActorRef,
+        context_pack_ref: str,
+        payload: dict[str, Any],
+        *,
+        version: str = "1.0.0",
+        status: ArtifactStatus = ArtifactStatus.DRAFT,
+        inputs: list[ArtifactRef] | None = None,
+        outputs: list[ArtifactRef] | None = None,
+        notes: str = "",
+    ) -> "ArtifactEnvelope":
+        if not SEMVER_RE.match(version):
+            raise ValueError(f"invalid semver version: {version}")
+        prefix = ARTIFACT_TYPE_PREFIX[artifact_type]
+        artifact_id = f"{prefix}-{uuid.uuid4().hex[:8]}"
+        return cls(
+            artifact_id=artifact_id,
+            artifact_type=artifact_type,
+            version=version,
+            status=status,
+            created_at=datetime.now(UTC),
+            created_by=created_by,
+            context_pack_ref=context_pack_ref,
+            inputs=inputs or [],
+            outputs=outputs or [],
+            notes=notes,
+            payload=payload,
+        )
+
+
+class SplitTaskInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str
+    acceptance_criteria: list[str] = Field(min_length=1)
+    depends_on: list[str] = Field(default_factory=list)
+
+
+class RevisedPlanInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    module_id: str
+    description: str
+    depends_on: list[str] = Field(default_factory=list)
+
+
+class HumanResolution(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: HumanResolutionAction
+    rationale: str | None = None
+    amended_acceptance_criteria: list[str] = Field(default_factory=list)
+    amendment_rationale: str | None = None
+    new_tasks: list[SplitTaskInput] = Field(default_factory=list)
+    revised_micro_plan: list[RevisedPlanInput] = Field(default_factory=list)
+    fix_description: str | None = None
+    fix_artifacts: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_action_payload(self) -> "HumanResolution":
+        action = self.action
+        if action == HumanResolutionAction.APPROVE_OVERRIDE and not (self.rationale and self.rationale.strip()):
+            raise ValueError("APPROVE_OVERRIDE requires rationale")
+        if action == HumanResolutionAction.AMEND_SPEC:
+            if not self.amended_acceptance_criteria:
+                raise ValueError("AMEND_SPEC requires amended_acceptance_criteria")
+            if not (self.amendment_rationale and self.amendment_rationale.strip()):
+                raise ValueError("AMEND_SPEC requires amendment_rationale")
+        if action == HumanResolutionAction.SPLIT_TASK and not self.new_tasks:
+            raise ValueError("SPLIT_TASK requires new_tasks")
+        if action == HumanResolutionAction.REVISE_PLAN and not self.revised_micro_plan:
+            raise ValueError("REVISE_PLAN requires revised_micro_plan")
+        if action == HumanResolutionAction.PROVIDE_FIX:
+            if not (self.fix_description and self.fix_description.strip()):
+                raise ValueError("PROVIDE_FIX requires fix_description")
+            if not self.fix_artifacts:
+                raise ValueError("PROVIDE_FIX requires fix_artifacts")
+        if action == HumanResolutionAction.ABANDON_TASK and not (self.rationale and self.rationale.strip()):
+            raise ValueError("ABANDON_TASK requires rationale")
+        return self
