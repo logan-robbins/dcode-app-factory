@@ -10,14 +10,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypedDict
 
-from deepagents import create_deep_agent
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
-from .backends import build_factory_backend
+from .agent_runtime import RoleAgentRuntime
 from .debate import DebateGraph
-from .llm import get_chat_model
 from .models import (
     AdjudicationDecision,
     Adjudication,
@@ -35,6 +33,14 @@ from .models import (
     EscalationArtifact,
     FailedInvariant,
     FractalPlan,
+    DependencyManagerDecision,
+    DispatchDecision,
+    StateAuditDecision,
+    ProductRoleReport,
+    MicroPlanReview,
+    ShipperDecision,
+    ReleaseGateDecision,
+    ReleaseManagerDecision,
     HumanResolution,
     HumanResolutionAction,
     InterfaceChangeException,
@@ -94,43 +100,61 @@ class ProductLoop:
         self.settings = settings if settings is not None else RuntimeSettings.from_env()
         root = Path(state_store_root) if state_store_root is not None else Path(self.settings.state_store_root)
         self.state_store = FactoryStateStore(root, project_id=self.settings.project_id)
+        self.role_runtime = RoleAgentRuntime(
+            stage="product_loop",
+            settings=self.settings,
+            backend_root=self.state_store.root,
+        )
+        self.role_runtime.require_roles(["researcher", "structurer", "validator"])
 
-    def _invoke_deep_agent(self, spec_json_path: Path) -> None:
-        model = get_chat_model(model_name=self.settings.model_frontier, temperature=0.0)
-        backend = build_factory_backend(self.state_store.root)
-        agent = create_deep_agent(
-            model=model,
-            tools=[web_search, validate_spec_tool, search_code_index, emit_structured_spec_tool],
-            backend=backend,
-            system_prompt=(
-                "You are the Product Loop quality gate for a production software factory and must behave like a "
-                "technical product owner plus software architect. "
-                "Policy: contract-first, reuse-first, separation-of-concerns, and no speculative output. "
-                "You must call `validate_spec` for schema/completeness checks, then call "
-                "`search_code_index` for each major task objective before recommending any CREATE_NEW path. "
-                "If no reuse is viable, explicitly state the failed match reason. "
-                "Return concise warnings, architecture risks, and release readiness only."
-            ),
-            name="product-loop-agent",
-        )
-        # Run a real invocation for stack compliance. The deterministic parser still owns source-of-truth shaping.
-        agent.invoke(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": (
-                            "Validate this ProductSpec JSON path, run reuse-first checks against code index, "
-                            "and summarize warnings/readiness in <=12 bullets. "
-                            f"Request kind: {self.request_kind}. "
-                            f"Target codebase root: {self.target_codebase_root or 'current workspace'}. "
-                            f"Path: {spec_json_path}"
-                        ),
-                    }
-                ]
-            },
-            config={"configurable": {"thread_id": f"product-loop-{uuid.uuid4().hex[:8]}"}},
-        )
+    def _invoke_deep_agent(self, spec_json_path: Path) -> dict[str, ProductRoleReport]:
+        reports: dict[str, ProductRoleReport] = {}
+        role_specs = {
+            "researcher": "web and market-reuse discovery",
+            "structurer": "spec structure quality and task decomposition review",
+            "validator": "final product-loop release-readiness gate",
+        }
+
+        for role in ("researcher", "structurer", "validator"):
+            role_context = self.role_runtime.role_context_line(role)
+            prior_context = {k: v.model_dump(mode="json") for k, v in reports.items()}
+            system_prompt = (
+                f"You are the Product Loop {role} role for a production software factory. "
+                "Operate with contract-first, reuse-first, and no speculative output. "
+                "You must return a single JSON object for ProductRoleReport with exact keys only: "
+                "approved, summary, warnings, blocking_issues, recommended_actions. "
+                f"{role_context} "
+                "Use tools when needed, and call validate_spec plus search_code_index before any create-new recommendation."
+            )
+            user_message = (
+                "Review the ProductSpec artifact and provide your role decision.\n"
+                f"Role objective: {role_specs[role]}.\n"
+                f"Request kind: {self.request_kind}.\n"
+                f"Target codebase root: {self.target_codebase_root or 'current workspace'}.\n"
+                f"Spec JSON path: {spec_json_path}\n"
+                f"Prior role outputs: {json.dumps(prior_context, sort_keys=True)}"
+            )
+            payload = self.role_runtime.invoke_deepagent_json(
+                role=role,
+                system_prompt=system_prompt,
+                user_message=user_message,
+                tools=[web_search, validate_spec_tool, search_code_index, emit_structured_spec_tool],
+                name=f"product-loop-{role}",
+            )
+            report = ProductRoleReport.model_validate(payload)
+            reports[role] = report
+            self.state_store.write_agent_output(
+                stage="product_loop",
+                role=role,
+                run_id=spec_json_path.stem,
+                payload=report.model_dump(mode="json"),
+            )
+
+        validator = reports["validator"]
+        if not validator.approved:
+            issues = "; ".join(validator.blocking_issues) or validator.summary
+            raise ValueError(f"Product role validator rejected spec: {issues}")
+        return reports
 
     def run(self) -> ProductSpec:
         spec = parse_raw_request_to_product_spec(
@@ -160,7 +184,7 @@ class ProductLoop:
         self.state_store.write_product_spec(spec, markdown)
         emit_structured_spec(spec, self.state_store.product_spec_json_path)
 
-        # Required architecture binding: deepagents create_agent/create_deep_agent invocation.
+        # Required architecture binding: deepagents role agents execute as Product Loop quality gates.
         self._invoke_deep_agent(self.state_store.product_spec_json_path)
         return spec
 
@@ -220,9 +244,17 @@ class EngineeringLoop:
         self.state_store = state_store
         self.settings = settings
         self.artifacts = ArtifactStoreService(state_store)
+        self.role_runtime = RoleAgentRuntime(
+            stage="engineering_loop",
+            settings=self.settings,
+            backend_root=self.state_store.root,
+        )
+        self.role_runtime.require_roles(["micro_planner", "proposer", "challenger", "arbiter", "shipper"])
+        if not self.settings.debate_use_llm:
+            raise ValueError("FACTORY_DEBATE_USE_LLM=false is unsupported in fully agentic mode")
         self.debate_graph = DebateGraph(
             store=state_store,
-            model_name=settings.model_efficient,
+            role_runtime=self.role_runtime,
             use_llm=settings.debate_use_llm,
             propagate_parent_halt=False,
         )
@@ -650,6 +682,30 @@ class EngineeringLoop:
         service_contract = self._build_service_contract(task, plan)
         class_contracts = self._build_class_contracts(task, plan)
 
+        micro_plan_review = self.role_runtime.invoke_structured(
+            role="micro_planner",
+            schema=MicroPlanReview,
+            prompt=(
+                "You are the micro_planner role in Engineering Loop. "
+                f"{self.role_runtime.role_context_line('micro_planner')} "
+                "Validate that this micro plan is atomic, dependency-safe, and contract-aligned. "
+                "Return MicroPlanReview JSON only.\n"
+                f"Task={task.model_dump_json()}\n"
+                f"Plan={plan.model_dump_json()}\n"
+                f"SystemContract={system_contract.model_dump_json()}\n"
+                f"ServiceContract={service_contract.model_dump_json()}"
+            ),
+        )
+        self.state_store.write_agent_output(
+            stage="engineering_loop",
+            role="micro_planner",
+            run_id=task.task_id,
+            payload=micro_plan_review.model_dump(mode="json"),
+        )
+        if not micro_plan_review.approved:
+            blockers = "; ".join(micro_plan_review.blockers) or micro_plan_review.rationale
+            raise ValueError(f"micro_planner rejected micro plan for {task.task_id}: {blockers}")
+
         self.state_store.write_system_contract(system_contract)
         self.state_store.write_service_contract(service_contract)
         for class_contract in class_contracts:
@@ -961,6 +1017,7 @@ class EngineeringLoop:
             task_id=task.task_id,
             module_id=module.module_id,
             target_artifact_id=contract_envelope.artifact_id,
+            context_pack_refs=cp_refs,
             contract_summary={
                 "inputs": [entry.model_dump(mode="json") for entry in contract.inputs],
                 "outputs": [entry.model_dump(mode="json") for entry in contract.outputs],
@@ -978,6 +1035,42 @@ class EngineeringLoop:
         )
 
         if debate.passed:
+            shipper_decision = self.role_runtime.invoke_structured(
+                role="shipper",
+                schema=ShipperDecision,
+                prompt=(
+                    "You are the shipper role in Engineering Loop and must decide SHIP or NO_SHIP from evidence only. "
+                    f"{self.role_runtime.role_context_line('shipper')} "
+                    "Return ShipperDecision JSON only.\n"
+                    f"TaskID={task.task_id}\n"
+                    f"ModuleID={module.module_id}\n"
+                    f"Contract={contract.model_dump_json(by_alias=True)}\n"
+                    f"DebatePassed={debate.passed}\n"
+                    f"DebateAdjudication={debate.adjudication.model_dump_json()}\n"
+                    f"ReuseDecision={reuse_decision_value}\n"
+                    f"ResolvedDependencyRefs={json.dumps(resolved_dependency_refs)}"
+                ),
+            )
+            self.state_store.write_agent_output(
+                stage="engineering_loop",
+                role="shipper",
+                run_id=f"{task.task_id}-{module.module_id}",
+                payload=shipper_decision.model_dump(mode="json"),
+            )
+            if shipper_decision.ship_directive != ShipDirective.SHIP:
+                module_status[module_id] = "FAILED"
+                failed_modules.append(module_id)
+                newly_abandoned = self._mark_abandoned(plan, module_id, module_status)
+                abandoned_modules.extend(newly_abandoned)
+                return {
+                    "module_cursor": cursor + 1,
+                    "module_status": module_status,
+                    "module_refs": module_refs,
+                    "failed_modules": failed_modules,
+                    "abandoned_modules": abandoned_modules,
+                    "shipped_modules": shipped_modules,
+                }
+
             verification = ShipVerification(
                 result="PASS",
                 interface_fingerprint=contract.interface_fingerprint,
@@ -1119,6 +1212,12 @@ class ProjectLoop:
         self.artifacts = ArtifactStoreService(self.state_store)
         self.enable_interrupts = enable_interrupts
         self._task_lookup = {task.task_id: task for task in self.spec.iter_tasks()}
+        self.role_runtime = RoleAgentRuntime(
+            stage="project_loop",
+            settings=self.settings,
+            backend_root=self.state_store.root,
+        )
+        self.role_runtime.require_roles(["dependency_manager", "dispatcher", "state_auditor"])
 
         self.checkpoint_path = Path(self.settings.checkpoint_db)
         if not self.checkpoint_path.is_absolute():
@@ -1187,6 +1286,28 @@ class ProjectLoop:
             self.state_store.write_task_file(task.task_id, self._task_file_markdown(task))
 
         project_state = build_project_state(spec, project_id=self.settings.project_id)
+        dependency_decision = self.role_runtime.invoke_structured(
+            role="dependency_manager",
+            schema=DependencyManagerDecision,
+            prompt=(
+                "You are the dependency_manager role for Project Loop task-DAG initialization. "
+                f"{self.role_runtime.role_context_line('dependency_manager')} "
+                "Validate dependency closure, ordering, and launch readiness. "
+                "Return DependencyManagerDecision JSON only.\n"
+                f"Spec={spec.model_dump_json()}\n"
+                f"TaskGraph={json.dumps({task.task_id: task.depends_on for task in spec.iter_tasks()}, sort_keys=True)}"
+            ),
+        )
+        self.state_store.write_agent_output(
+            stage="project_loop",
+            role="dependency_manager",
+            run_id=spec.spec_id,
+            payload=dependency_decision.model_dump(mode="json"),
+        )
+        if not dependency_decision.approved:
+            blockers = ", ".join(dependency_decision.blocking_dependencies) or dependency_decision.rationale
+            raise ValueError(f"dependency_manager rejected project initialization: {blockers}")
+
         self.state_store.write_project_state(project_state)
         return {"spec": spec.model_dump(mode="json")}
 
@@ -1206,11 +1327,34 @@ class ProjectLoop:
             return {"halted": True, "complete": False, "current_task_id": None}
 
         eligible = self._eligible_task_ids(state_machine)
-        if not eligible:
+        dispatch_decision = self.role_runtime.invoke_structured(
+            role="dispatcher",
+            schema=DispatchDecision,
+            prompt=(
+                "You are the dispatcher role for Project Loop. "
+                f"{self.role_runtime.role_context_line('dispatcher')} "
+                "Choose the next task from ready_queue or select null if no dispatch should occur. "
+                "Return DispatchDecision JSON only.\n"
+                f"ReadyQueue={json.dumps(eligible)}\n"
+                f"TaskStatuses={json.dumps({task_id: entry.status.value for task_id, entry in state_machine.tasks.items()}, sort_keys=True)}"
+            ),
+        )
+        self.state_store.write_agent_output(
+            stage="project_loop",
+            role="dispatcher",
+            run_id=f"dispatch-{uuid.uuid4().hex[:8]}",
+            payload=dispatch_decision.model_dump(mode="json"),
+        )
+        selected_task_id = dispatch_decision.selected_task_id
+        if selected_task_id is None:
             has_pending = any(task.status == TaskStatus.PENDING for task in state_machine.tasks.values())
             return {"complete": not has_pending, "current_task_id": None}
+        if selected_task_id not in eligible:
+            raise ValueError(
+                f"dispatcher selected task outside ready_queue: {selected_task_id}; ready_queue={eligible}"
+            )
 
-        task_id = eligible[0]
+        task_id = selected_task_id
         state_machine.transition(task_id, TaskStatus.IN_PROGRESS)
         self.state_store.write_project_state(state_machine)
         return {"current_task_id": task_id, "complete": False, "halted": False}
@@ -1327,6 +1471,39 @@ class ProjectLoop:
             task_state.status = TaskStatus.ABANDONED
             task_state.halted_reason = resolution.rationale
 
+    def _run_state_auditor(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        transition_status: TaskStatus,
+        state_machine: ProjectState,
+        engineering_result: dict[str, Any],
+    ) -> None:
+        audit = self.role_runtime.invoke_structured(
+            role="state_auditor",
+            schema=StateAuditDecision,
+            prompt=(
+                "You are the state_auditor role in Project Loop. "
+                f"{self.role_runtime.role_context_line('state_auditor')} "
+                "Audit this state transition for correctness and policy compliance. "
+                "Return StateAuditDecision JSON only.\n"
+                f"TaskID={task_id}\n"
+                f"TransitionStatus={transition_status.value}\n"
+                f"EngineeringResult={json.dumps(engineering_result, sort_keys=True, default=str)}\n"
+                f"ProjectState={state_machine.model_dump_json()}"
+            ),
+        )
+        self.state_store.write_agent_output(
+            stage="project_loop",
+            role="state_auditor",
+            run_id=run_id,
+            payload=audit.model_dump(mode="json"),
+        )
+        if not audit.valid:
+            findings = "; ".join(audit.findings) or audit.rationale
+            raise ValueError(f"state_auditor rejected transition for {task_id}: {findings}")
+
     def _update_state_machine_node(self, state: ProjectStateGraphState) -> dict[str, Any]:
         result = state.get("last_engineering_result")
         if not result:
@@ -1350,6 +1527,13 @@ class ProjectLoop:
             task_state.shipped_at = datetime.now(UTC)
             self._clear_blocked_fixed_point(state_machine)
             self.state_store.write_project_state(state_machine)
+            self._run_state_auditor(
+                run_id=f"{task_id}-shipped",
+                task_id=task_id,
+                transition_status=TaskStatus.SHIPPED,
+                state_machine=state_machine,
+                engineering_result=result,
+            )
             return {"halted": False}
 
         task_state.status = TaskStatus.HALTED
@@ -1357,6 +1541,13 @@ class ProjectLoop:
         task_state.escalation_ref = result.get("escalation_id")
         self._mark_downstream_blocked(state_machine, task_id)
         self.state_store.write_project_state(state_machine)
+        self._run_state_auditor(
+            run_id=f"{task_id}-halted",
+            task_id=task_id,
+            transition_status=TaskStatus.HALTED,
+            state_machine=state_machine,
+            engineering_result=result,
+        )
 
         resolution_payload = state.get("resolution")
         if resolution_payload:
@@ -1364,6 +1555,13 @@ class ProjectLoop:
             self._process_resolution(state_machine, task_id, resolution)
             self._clear_blocked_fixed_point(state_machine)
             self.state_store.write_project_state(state_machine)
+            self._run_state_auditor(
+                run_id=f"{task_id}-resolution",
+                task_id=task_id,
+                transition_status=state_machine.tasks[task_id].status,
+                state_machine=state_machine,
+                engineering_result=result,
+            )
             return {"halted": False, "resolution": None}
 
         if self.enable_interrupts:
@@ -1417,10 +1615,24 @@ class ReleaseLoopState(TypedDict, total=False):
 class ReleaseLoop:
     """Release stage StateGraph with dependency/fingerprint/deprecation/code-index gates."""
 
-    def __init__(self, *, state_store: FactoryStateStore, code_index: CodeIndex, spec: ProductSpec) -> None:
+    def __init__(
+        self,
+        *,
+        state_store: FactoryStateStore,
+        code_index: CodeIndex,
+        spec: ProductSpec,
+        settings: RuntimeSettings | None = None,
+    ) -> None:
+        self.settings = settings if settings is not None else RuntimeSettings.from_env()
         self.state_store = state_store
         self.code_index = code_index
         self.spec = spec
+        self.role_runtime = RoleAgentRuntime(
+            stage="release_loop",
+            settings=self.settings,
+            backend_root=self.state_store.root,
+        )
+        self.role_runtime.require_roles(["gatekeeper", "release_manager"])
         self.graph = self._build_graph().compile()
 
     def _build_graph(self) -> StateGraph:
@@ -1552,7 +1764,7 @@ class ReleaseLoop:
                         f"Context pack {cp.cp_id} has CONTRACT_ONLY permission without level for path {permission.path}"
                     )
 
-        gates = {
+        objective_gates = {
             "dependency_check": "PASS" if dependency_pass else "FAIL",
             "fingerprint_check": "PASS" if fingerprint_pass else "FAIL",
             "deprecation_check": "PASS" if deprecation_pass else "FAIL",
@@ -1562,26 +1774,83 @@ class ReleaseLoop:
             "ownership_check": "PASS" if ownership_pass else "FAIL",
             "context_pack_compliance_check": "PASS" if context_pack_compliance_pass else "FAIL",
         }
-        overall = "PASS" if all(value == "PASS" for value in gates.values()) else "FAIL"
+        gatekeeper_decision = self.role_runtime.invoke_structured(
+            role="gatekeeper",
+            schema=ReleaseGateDecision,
+            prompt=(
+                "You are the gatekeeper role in Release Loop. "
+                f"{self.role_runtime.role_context_line('gatekeeper')} "
+                "Evaluate release gates from objective evidence and return ReleaseGateDecision JSON only.\n"
+                f"ReleaseID={state['release_id']}\n"
+                f"Modules={json.dumps(modules)}\n"
+                f"ObjectiveGateEvidence={json.dumps(objective_gates, sort_keys=True)}\n"
+                f"EvidenceNotes={json.dumps(notes)}"
+            ),
+        )
+        self.state_store.write_agent_output(
+            stage="release_loop",
+            role="gatekeeper",
+            run_id=state["release_id"],
+            payload=gatekeeper_decision.model_dump(mode="json"),
+        )
+        decided_gates = gatekeeper_decision.gate_map()
+        for gate_name, evidence_result in objective_gates.items():
+            if evidence_result == "FAIL" and decided_gates[gate_name] != "FAIL":
+                raise ValueError(
+                    f"gatekeeper returned PASS for objectively failing gate '{gate_name}' in {state['release_id']}"
+                )
+        overall = "PASS" if all(value == "PASS" for value in decided_gates.values()) else "FAIL"
+        notes_payload = notes + gatekeeper_decision.notes
         return {
-            "integration_gates": gates,
+            "integration_gates": decided_gates,
             "overall_result": overall,
-            "notes": "\n".join(notes) if notes else "All release gates passed",
+            "notes": "\n".join(notes_payload) if notes_payload else "All release gates passed",
         }
 
     def _finalize_node(self, state: ReleaseLoopState) -> dict[str, Any]:
+        release_manager_decision = self.role_runtime.invoke_structured(
+            role="release_manager",
+            schema=ReleaseManagerDecision,
+            prompt=(
+                "You are the release_manager role in Release Loop. "
+                f"{self.role_runtime.role_context_line('release_manager')} "
+                "Finalize release outcome from gate decisions and produce ReleaseManagerDecision JSON only.\n"
+                f"ReleaseID={state['release_id']}\n"
+                f"IntegrationGates={json.dumps(state['integration_gates'], sort_keys=True)}\n"
+                f"GateOverall={state['overall_result']}\n"
+                f"GateNotes={state['notes']}\n"
+                f"Modules={json.dumps(state['modules'])}"
+            ),
+        )
+        self.state_store.write_agent_output(
+            stage="release_loop",
+            role="release_manager",
+            run_id=state["release_id"],
+            payload=release_manager_decision.model_dump(mode="json"),
+        )
+        if any(value == "FAIL" for value in state["integration_gates"].values()) and release_manager_decision.overall_result != "FAIL":
+            raise ValueError(
+                f"release_manager returned PASS for release with failing gates: {state['release_id']}"
+            )
+        notes = [state["notes"], release_manager_decision.rationale, *release_manager_decision.release_notes]
         manifest = {
             "release_id": state["release_id"],
             "created_at": datetime.now(UTC).isoformat(),
             "spec_version": self.spec.spec_version,
             "modules": [{"module_ref": module_ref, "ship_ref": module_ref.replace("MM", "SHIP")} for module_ref in state["modules"]],
             "integration_gates": state["integration_gates"],
-            "overall_result": state["overall_result"],
-            "notes": state["notes"],
+            "overall_result": release_manager_decision.overall_result,
+            "notes": "\n".join(note for note in notes if note),
         }
         path = self.state_store.release_dir / f"{state['release_id']}.json"
         path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        return state
+        return {
+            "release_id": state["release_id"],
+            "modules": state["modules"],
+            "integration_gates": state["integration_gates"],
+            "overall_result": release_manager_decision.overall_result,
+            "notes": manifest["notes"],
+        }
 
     def run(self) -> dict[str, Any]:
         return self.graph.invoke({})
@@ -1725,7 +1994,7 @@ class FactoryOrchestrator:
 
     def _release_node(self, state: OuterGraphState) -> dict[str, Any]:
         spec = ProductSpec.model_validate(state["spec"])
-        loop = ReleaseLoop(state_store=self.state_store, code_index=self.code_index, spec=spec)
+        loop = ReleaseLoop(state_store=self.state_store, code_index=self.code_index, spec=spec, settings=self.settings)
         result = loop.run()
         return {"release_result": result}
 

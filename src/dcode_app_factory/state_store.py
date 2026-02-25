@@ -63,6 +63,7 @@ class FactoryStateStore:
         self.code_index_dir = self.root / "code_index"
         self.debates_dir = self.root / "debates"
         self.context_packs_dir = self.root / "context_packs"
+        self.agent_outputs_dir = self.root / "agent_outputs"
         self.exceptions_dir = self.root / "exceptions"
         self.escalations_dir = self.root / "escalations"
         self.release_dir = self.root / "release"
@@ -82,6 +83,7 @@ class FactoryStateStore:
             self.code_index_dir,
             self.debates_dir,
             self.context_packs_dir,
+            self.agent_outputs_dir,
             self.exceptions_dir,
             self.escalations_dir,
             self.release_dir,
@@ -126,6 +128,23 @@ class FactoryStateStore:
     def write_context_pack(self, context_pack: ContextPack) -> Path:
         path = self.context_packs_dir / f"{context_pack.cp_id}.json"
         path.write_text(context_pack.model_dump_json(indent=2), encoding="utf-8")
+        return path
+
+    def read_context_pack(self, cp_id: str) -> ContextPack:
+        path = self.context_packs_dir / f"{cp_id}.json"
+        if not path.is_file():
+            raise FileNotFoundError(f"context pack not found: {path}")
+        return ContextPack.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def write_agent_output(self, *, stage: str, role: str, run_id: str, payload: dict[str, Any]) -> Path:
+        safe_stage = re.sub(r"[^A-Za-z0-9_.-]+", "-", stage.strip()).strip("-")
+        safe_role = re.sub(r"[^A-Za-z0-9_.-]+", "-", role.strip()).strip("-")
+        safe_run = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id.strip()).strip("-")
+        if not safe_stage or not safe_role or not safe_run:
+            raise ValueError("stage, role, and run_id must contain filesystem-safe characters")
+        path = self.agent_outputs_dir / safe_stage / safe_role / f"{safe_run}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
         return path
 
     def write_interface_change_exception(self, exc: InterfaceChangeException) -> Path:

@@ -188,6 +188,90 @@ class AgentConfig(BaseModel):
     allowed_context_sections: list[str]
 
 
+class ProductRoleReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approved: bool
+    summary: str
+    warnings: list[str] = Field(default_factory=list)
+    blocking_issues: list[str] = Field(default_factory=list)
+    recommended_actions: list[str] = Field(default_factory=list)
+
+
+class DependencyManagerDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approved: bool
+    rationale: str
+    blocking_dependencies: list[str] = Field(default_factory=list)
+
+
+class DispatchDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    selected_task_id: str | None = None
+    rationale: str
+
+
+class StateAuditDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    valid: bool
+    rationale: str
+    findings: list[str] = Field(default_factory=list)
+
+
+class MicroPlanReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approved: bool
+    rationale: str
+    blockers: list[str] = Field(default_factory=list)
+    required_revisions: list[str] = Field(default_factory=list)
+
+
+class ShipperDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ship_directive: ShipDirective
+    rationale: str
+    required_fixes: list[str] = Field(default_factory=list)
+
+
+class ReleaseGateDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dependency_check: Literal["PASS", "FAIL"]
+    fingerprint_check: Literal["PASS", "FAIL"]
+    deprecation_check: Literal["PASS", "FAIL"]
+    code_index_check: Literal["PASS", "FAIL"]
+    contract_completeness_check: Literal["PASS", "FAIL"]
+    compatibility_check: Literal["PASS", "FAIL"]
+    ownership_check: Literal["PASS", "FAIL"]
+    context_pack_compliance_check: Literal["PASS", "FAIL"]
+    notes: list[str] = Field(default_factory=list)
+
+    def gate_map(self) -> dict[str, str]:
+        return {
+            "dependency_check": self.dependency_check,
+            "fingerprint_check": self.fingerprint_check,
+            "deprecation_check": self.deprecation_check,
+            "code_index_check": self.code_index_check,
+            "contract_completeness_check": self.contract_completeness_check,
+            "compatibility_check": self.compatibility_check,
+            "ownership_check": self.ownership_check,
+            "context_pack_compliance_check": self.context_pack_compliance_check,
+        }
+
+
+class ReleaseManagerDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    overall_result: Literal["PASS", "FAIL"]
+    rationale: str
+    release_notes: list[str] = Field(default_factory=list)
+
+
 class IOContractSketch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

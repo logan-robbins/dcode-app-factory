@@ -4,10 +4,11 @@ LangGraph + deepagents implementation of the AI software product factory defined
 
 - Product Loop with structured `ProductSpec` validation and emission
 - Unified request intake for full app specs and incremental feature/bugfix/refactor/task requests
-- Project Loop `StateGraph` dispatch cycle (`init_state_machine -> dispatch -> engineering -> update_state_machine`)
-- Engineering Loop `StateGraph` with level-aware `micro_plan` (L2 system, L3 service, L4 component, selective L5 class contracts) + per-module iteration and nested debate subgraph
-- Debate subgraph routing (`propose -> challenge -> route -> revise/adjudicate -> ship/halt`) using `Command(goto=...)` and parent propagation support
-- Release Loop integration gates (`dependency`, `fingerprint`, `deprecation`, `code_index`, `contract_completeness`, `compatibility`, `ownership`, `context_pack_compliance`)
+- Product Loop multi-role deepagents review (`researcher -> structurer -> validator`) with gate-enforced role outputs
+- Project Loop `StateGraph` dispatch cycle (`init_state_machine -> dispatch -> engineering -> update_state_machine`) with active `dependency_manager`, `dispatcher`, and `state_auditor` role agents
+- Engineering Loop `StateGraph` with level-aware `micro_plan` (L2 system, L3 service, L4 component, selective L5 class contracts) + per-module iteration, active `micro_planner`/`shipper` role agents, and nested debate subgraph
+- Debate subgraph routing (`propose -> challenge -> route -> revise/adjudicate -> ship/halt`) using active role agents (`proposer`, `challenger`, `arbiter`) with no deterministic verdict overrides
+- Release Loop integration gates (`dependency`, `fingerprint`, `deprecation`, `code_index`, `contract_completeness`, `compatibility`, `ownership`, `context_pack_compliance`) with active `gatekeeper` and `release_manager` role agents
 - Filesystem state-store with universal artifact envelopes, levelled contract persistence, context-pack persistence, exceptions, escalations, debates, modules, and release manifests
 - Chroma-backed append-only Code Index with OpenAI semantic embeddings by default, metadata filters, lifecycle transitions, and model-change reindex support
 - Backend enforcement wrappers for immutability, opaque implementation access control, and level-aware context-pack permissions
@@ -462,7 +463,7 @@ Model routing:
 - `FACTORY_MODEL_EFFICIENT` (default: `gpt-4o-mini`)
 - `FACTORY_MODEL_ECONOMY` (default: `gpt-4o-mini`)
 - `FACTORY_EMBEDDING_MODEL` (default: `text-embedding-3-large`; deterministic test model value: `deterministic-hash-384`)
-- `FACTORY_DEBATE_USE_LLM` (default: `true`; real model-backed debate path)
+- `FACTORY_DEBATE_USE_LLM` (must be `true`; set to `false` now fails fast in fully agentic mode)
 
 Search tooling:
 
@@ -484,6 +485,7 @@ Primary directories under `state_store/projects/{project_id}/`:
 - `class_contracts/{class_id}/{version}/contract.json`
 - `debates/{artifact_id}/` (`proposal.json`, `challenge.json`, `adjudication.json`)
 - `context_packs/{cp_id}.json`
+- `agent_outputs/{stage}/{role}/{run_id}.json`
 - `exceptions/{exception_id}.json`
 - `escalations/{escalation_id}.json`
 - `code_index/` (Chroma persistence)
@@ -522,7 +524,7 @@ ls -1 state_store/projects/PROJECT-001/release
 - Product Loop evaluates every request as a technical product-owner/architect pass before project dispatch.
 - Product + Engineering flows enforce reuse-first policy and execute `search_code_index` before create-new decisions.
 - Engineering emits level-aware contracts (L2/L3/L4 and selective L5) before module shipping and enforces black-box consumption via context-pack scopes.
-- Engineering debate runs model-backed by default with structured output via `function_calling` + `strict=true` to avoid current `json_schema` serializer warnings in the LangChain/OpenAI response path; set `FACTORY_DEBATE_USE_LLM=false` only for deterministic local testing.
+- Engineering debate is fully model-backed with structured output via `function_calling` + `strict=true`; deterministic debate fallback paths were removed.
 - Engineering contract dependencies are resolved from actual shipped module refs (not hardcoded `@1.0.0`), and release manifests include transitive dependency closure before running release gates.
 - Release gates include dependency, fingerprint, deprecation, code-index, contract-completeness, compatibility, ownership, and context-pack compliance checks.
 - Opaque access-denied errors use the required fixed format defined in SPEC §12.5.

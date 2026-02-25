@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+import json
 
 import pytest
 from deepagents.backends import FilesystemBackend
@@ -33,6 +34,7 @@ from dcode_app_factory.backends import (
     SEALED_ACCESS_ERROR_TEMPLATE,
     seal_module_version,
 )
+from dcode_app_factory.agent_runtime import RoleAgentRuntime
 from dcode_app_factory.debate import DebateGraph, DebateResult
 from dcode_app_factory.llm import get_structured_chat_model, normalize_structured_output
 from dcode_app_factory.loops import ReleaseLoop
@@ -59,6 +61,14 @@ from dcode_app_factory.models import (
     MicroPlanModule,
     ProjectState,
     ReuseSearchCandidate,
+    ProductRoleReport,
+    DependencyManagerDecision,
+    DispatchDecision,
+    StateAuditDecision,
+    MicroPlanReview,
+    ShipperDecision,
+    ReleaseGateDecision,
+    ReleaseManagerDecision,
     ProposedContractDelta,
     RaisedBy,
     RubricAssessment,
@@ -164,19 +174,145 @@ def _deterministic_embeddings_for_tests(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("FACTORY_EMBEDDING_MODEL", "deterministic-hash-384")
 
 
+@pytest.fixture(autouse=True)
+def _mock_role_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Adapter:
+        def __init__(self, schema: object) -> None:
+            self.schema = schema
+
+        def invoke(self, prompt: str):  # noqa: ANN201
+            _ = prompt
+            if self.schema is Proposal:
+                return Proposal(
+                    proposal_id="PROP-deadbeef",
+                    target_artifact_id="CTR-deadbeef",
+                    claim="Implements module behavior",
+                    deliverable_ref="/modules/module",
+                    acceptance_checks=["returns expected output"],
+                )
+            if self.schema is Challenge:
+                return Challenge(
+                    challenge_id="CHAL-deadbeef",
+                    target_artifact_id="CTR-deadbeef",
+                    verdict="PASS",
+                    failures=[],
+                    rubric_assessments=[
+                        RubricAssessment(criterion=f"R{i}", assessment="MET", evidence="verified")
+                        for i in range(1, 7)
+                    ],
+                )
+            if self.schema is Adjudication:
+                return Adjudication(
+                    adjudication_id="ADJ-deadbeef",
+                    target_artifact_id="CTR-deadbeef",
+                    decision=AdjudicationDecision.APPROVE,
+                    amendments=[],
+                    rationale="All checks met",
+                    ship_directive=ShipDirective.SHIP,
+                )
+            raise AssertionError(f"unexpected schema adapter request: {self.schema}")
+
+    def _fake_structured_adapter(self, *, role: str, schema):  # noqa: ANN001,ANN201
+        _ = self, role
+        return _Adapter(schema)
+
+    def _extract_json_after(prompt: str, key: str) -> dict[str, str]:
+        for line in prompt.splitlines():
+            if line.startswith(f"{key}="):
+                return json.loads(line.split("=", 1)[1])
+        return {}
+
+    def _extract_list_after(prompt: str, key: str) -> list[str]:
+        for line in prompt.splitlines():
+            if line.startswith(f"{key}="):
+                return json.loads(line.split("=", 1)[1])
+        return []
+
+    def _extract_value_after(prompt: str, key: str) -> str:
+        for line in prompt.splitlines():
+            if line.startswith(f"{key}="):
+                return line.split("=", 1)[1].strip()
+        return ""
+
+    def _fake_invoke_structured(self, *, role: str, schema, prompt: str):  # noqa: ANN001,ANN201
+        _ = self, role
+        if schema is DependencyManagerDecision:
+            return schema(approved=True, rationale="dependency graph valid", blocking_dependencies=[])
+        if schema is DispatchDecision:
+            queue = _extract_list_after(prompt, "ReadyQueue")
+            selected = queue[0] if queue else None
+            return schema(selected_task_id=selected, rationale="selected first ready task")
+        if schema is StateAuditDecision:
+            return schema(valid=True, rationale="state transition valid", findings=[])
+        if schema is MicroPlanReview:
+            return schema(approved=True, rationale="micro plan approved", blockers=[], required_revisions=[])
+        if schema is ShipperDecision:
+            return schema(ship_directive=ShipDirective.SHIP, rationale="ship approved", required_fixes=[])
+        if schema is ReleaseGateDecision:
+            gates = _extract_json_after(prompt, "ObjectiveGateEvidence")
+            return schema(
+                dependency_check=gates.get("dependency_check", "PASS"),
+                fingerprint_check=gates.get("fingerprint_check", "PASS"),
+                deprecation_check=gates.get("deprecation_check", "PASS"),
+                code_index_check=gates.get("code_index_check", "PASS"),
+                contract_completeness_check=gates.get("contract_completeness_check", "PASS"),
+                compatibility_check=gates.get("compatibility_check", "PASS"),
+                ownership_check=gates.get("ownership_check", "PASS"),
+                context_pack_compliance_check=gates.get("context_pack_compliance_check", "PASS"),
+                notes=[],
+            )
+        if schema is ReleaseManagerDecision:
+            gate_overall = _extract_value_after(prompt, "GateOverall")
+            overall = "FAIL" if gate_overall == "FAIL" else "PASS"
+            return schema(overall_result=overall, rationale="release manager finalized", release_notes=[])
+        raise AssertionError(f"unexpected invoke_structured schema: {schema}")
+
+    def _fake_invoke_deepagent_json(
+        self,
+        *,
+        role: str,
+        system_prompt: str,
+        user_message: str,
+        tools: list,
+        name: str,
+    ) -> dict[str, object]:
+        _ = self, role, system_prompt, user_message, tools, name
+        return ProductRoleReport(
+            approved=True,
+            summary="approved",
+            warnings=[],
+            blocking_issues=[],
+            recommended_actions=[],
+        ).model_dump(mode="json")
+
+    monkeypatch.setattr("dcode_app_factory.agent_runtime.RoleAgentRuntime.structured_adapter", _fake_structured_adapter)
+    monkeypatch.setattr("dcode_app_factory.agent_runtime.RoleAgentRuntime.invoke_structured", _fake_invoke_structured)
+    monkeypatch.setattr("dcode_app_factory.agent_runtime.RoleAgentRuntime.invoke_deepagent_json", _fake_invoke_deepagent_json)
+
+
 class _FakeDebateGraphPass:
     def __init__(
         self,
         *,
         store: FactoryStateStore,
-        model_name: str,
-        use_llm: bool = False,
+        role_runtime: RoleAgentRuntime,
+        use_llm: bool = True,
         propagate_parent_halt: bool = False,
     ) -> None:
-        _ = store, model_name, use_llm, propagate_parent_halt
+        _ = store, role_runtime, use_llm, propagate_parent_halt
 
-    def run(self, *, task_id: str, module_id: str, target_artifact_id: str, contract_summary: dict, context_summary: str, max_retries: int = 2) -> DebateResult:
-        _ = task_id, module_id, contract_summary, context_summary, max_retries
+    def run(
+        self,
+        *,
+        task_id: str,
+        module_id: str,
+        target_artifact_id: str,
+        contract_summary: dict,
+        context_summary: str,
+        context_pack_refs: dict[str, str] | None = None,
+        max_retries: int = 2,
+    ) -> DebateResult:
+        _ = task_id, module_id, contract_summary, context_summary, context_pack_refs, max_retries
         return _pass_debate_result(target_artifact_id)
 
 
@@ -185,14 +321,24 @@ class _FakeDebateGraphFailFirst:
         self,
         *,
         store: FactoryStateStore,
-        model_name: str,
-        use_llm: bool = False,
+        role_runtime: RoleAgentRuntime,
+        use_llm: bool = True,
         propagate_parent_halt: bool = False,
     ) -> None:
-        _ = store, model_name, use_llm, propagate_parent_halt
+        _ = store, role_runtime, use_llm, propagate_parent_halt
 
-    def run(self, *, task_id: str, module_id: str, target_artifact_id: str, contract_summary: dict, context_summary: str, max_retries: int = 2) -> DebateResult:
-        _ = task_id, contract_summary, context_summary, max_retries
+    def run(
+        self,
+        *,
+        task_id: str,
+        module_id: str,
+        target_artifact_id: str,
+        contract_summary: dict,
+        context_summary: str,
+        context_pack_refs: dict[str, str] | None = None,
+        max_retries: int = 2,
+    ) -> DebateResult:
+        _ = task_id, contract_summary, context_summary, context_pack_refs, max_retries
         if module_id.endswith("-01"):
             return _fail_debate_result(target_artifact_id)
         return _pass_debate_result(target_artifact_id)
@@ -609,7 +755,7 @@ def test_debate_graph_llm_path_uses_function_calling_structured_outputs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    calls: list[tuple[object, str, bool, bool]] = []
+    calls: list[tuple[str, object]] = []
 
     class _FakeStructuredAdapter:
         def __init__(self, schema: object) -> None:
@@ -649,28 +795,32 @@ def test_debate_graph_llm_path_uses_function_calling_structured_outputs(
                 ship_directive=ShipDirective.SHIP,
             )
 
-    def _fake_get_structured_chat_model(**kwargs):  # noqa: ANN003,ANN201
-        calls.append((kwargs["schema"], kwargs["method"], kwargs["strict"], kwargs["include_raw"]))
-        return _FakeStructuredAdapter(kwargs["schema"])
+    def _fake_structured_adapter(self, *, role: str, schema):  # noqa: ANN001,ANN201
+        _ = self
+        calls.append((role, schema))
+        return _FakeStructuredAdapter(schema)
 
-    monkeypatch.setattr("dcode_app_factory.debate.get_structured_chat_model", _fake_get_structured_chat_model)
+    monkeypatch.setattr("dcode_app_factory.agent_runtime.RoleAgentRuntime.structured_adapter", _fake_structured_adapter)
 
     store = FactoryStateStore(tmp_path)
-    debate = DebateGraph(store=store, model_name="gpt-4o-mini", use_llm=True)
+    settings = RuntimeSettings(state_store_root=str(tmp_path), project_id="ACME-DEBATE-1", embedding_model="deterministic-hash-384")
+    role_runtime = RoleAgentRuntime(stage="engineering_loop", settings=settings, backend_root=store.root)
+    debate = DebateGraph(store=store, role_runtime=role_runtime, use_llm=True)
     result = debate.run(
         task_id="T-demo-demo-demo-1",
         module_id="MM-demo-1",
         target_artifact_id="CTR-deadbeef",
         contract_summary={},
         context_summary="reuse_decision=CREATE_NEW; reuse_justification=no index match",
+        context_pack_refs={},
         max_retries=1,
     )
 
     assert result.passed is True
     assert calls == [
-        (Proposal, "function_calling", True, False),
-        (Challenge, "function_calling", True, False),
-        (Adjudication, "function_calling", True, False),
+        ("proposer", Proposal),
+        ("challenger", Challenge),
+        ("arbiter", Adjudication),
     ]
 
 
@@ -720,13 +870,16 @@ def test_debate_graph_halt_returns_without_parent_command(tmp_path: Path) -> Non
             }
 
     store = FactoryStateStore(tmp_path)
-    debate = _AlwaysFailDebate(store=store, model_name="gpt-4o-mini", use_llm=False)
+    settings = RuntimeSettings(state_store_root=str(tmp_path), project_id="ACME-DEBATE-2", embedding_model="deterministic-hash-384")
+    role_runtime = RoleAgentRuntime(stage="engineering_loop", settings=settings, backend_root=store.root)
+    debate = _AlwaysFailDebate(store=store, role_runtime=role_runtime, use_llm=True)
     result = debate.run(
         task_id="T-demo-1",
         module_id="MM-demo-1",
         target_artifact_id="CTR-deadbeef",
         contract_summary={},
         context_summary="demo",
+        context_pack_refs={},
         max_retries=2,
     )
     assert result.passed is False
@@ -765,7 +918,6 @@ def test_project_loop_emits_levelled_contract_artifacts(monkeypatch: pytest.Monk
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-LVL-001",
-        debate_use_llm=False,
         embedding_model="deterministic-hash-384",
         class_contract_policy="selective_shared",
     )
@@ -848,7 +1000,6 @@ def test_release_loop_includes_new_contract_and_context_gates(
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-REL-GATES",
-        debate_use_llm=False,
         embedding_model="deterministic-hash-384",
     )
     spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
@@ -873,7 +1024,6 @@ def test_release_loop_expands_transitive_dependencies(tmp_path: Path) -> None:
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-REL-CLOSURE",
-        debate_use_llm=False,
         embedding_model="deterministic-hash-384",
     )
     state_store = FactoryStateStore(tmp_path, project_id=settings.project_id)
@@ -976,7 +1126,6 @@ def test_micro_plan_decomposes_into_atomic_modules(tmp_path: Path) -> None:
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-ATOMIC",
-        debate_use_llm=False,
         embedding_model="deterministic-hash-384",
     )
     state_store = FactoryStateStore(tmp_path, project_id=settings.project_id)
@@ -1000,7 +1149,6 @@ def test_micro_plan_can_select_reuse_candidate(tmp_path: Path) -> None:
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-REUSE",
-        debate_use_llm=False,
         embedding_model="deterministic-hash-384",
     )
     state_store = FactoryStateStore(tmp_path, project_id=settings.project_id)
@@ -1043,7 +1191,6 @@ def test_engineering_loop_resolves_dependency_refs_and_versions_examples_path(tm
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-DEP-REFS",
-        debate_use_llm=False,
         embedding_model="deterministic-hash-384",
     )
     state_store = FactoryStateStore(tmp_path, project_id=settings.project_id)
