@@ -19,70 +19,18 @@ from .models import (
     ContextPack,
     EscalationArtifact,
     InterfaceChangeException,
+    ClassContract,
     MicroModuleContract,
     MicroPlan,
     ProductSpec,
     ProjectState,
     ProjectTaskState,
     Proposal,
+    ServiceContract,
     ShipEvidence,
-    Task,
+    SystemContract,
     TaskStatus,
 )
-from pydantic import BaseModel, ConfigDict, Field
-
-
-class TaskStateEntry(BaseModel):
-    """Backward-compatible state entry used by legacy tests and callers."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    task_id: str
-    status: str
-    depends_on: list[str]
-    declaration_order: int = Field(ge=0)
-
-    @classmethod
-    def from_task(
-        cls,
-        task: Task,
-        declaration_order: int,
-        *,
-        pillar: str | None = None,
-        epic: str | None = None,
-        story: str | None = None,
-    ) -> "TaskStateEntry":
-        _ = pillar, epic, story
-        return cls(
-            task_id=task.task_id,
-            status=TaskStatus.PENDING.value,
-            depends_on=list(task.depends_on),
-            declaration_order=declaration_order,
-        )
-
-
-class ProjectStateMachine(BaseModel):
-    """Backward-compatible task-only state machine snapshot."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    tasks: dict[str, TaskStateEntry] = Field(default_factory=dict)
-
-    def assert_valid_transition(self, task_id: str, old: TaskStatus, new: TaskStatus) -> None:
-        allowed: dict[TaskStatus, set[TaskStatus]] = {
-            TaskStatus.PENDING: {TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED},
-            TaskStatus.IN_PROGRESS: {TaskStatus.SHIPPED, TaskStatus.HALTED},
-            TaskStatus.BLOCKED: {TaskStatus.PENDING},
-            TaskStatus.HALTED: {TaskStatus.PENDING, TaskStatus.SHIPPED, TaskStatus.ABANDONED},
-            TaskStatus.SHIPPED: set(),
-            TaskStatus.ABANDONED: set(),
-        }
-        if new not in allowed[old]:
-            raise ValueError(f"Illegal task status transition for {task_id}: {old.value} -> {new.value}")
-
-    def to_json(self) -> str:
-        ordered = sorted(self.tasks.values(), key=lambda entry: entry.declaration_order)
-        return json.dumps({"tasks": [entry.model_dump(mode="json") for entry in ordered]}, indent=2, sort_keys=True)
 
 
 @contextmanager
@@ -109,6 +57,9 @@ class FactoryStateStore:
         self.tasks_dir = self.root / "tasks"
         self.artifacts_dir = self.root / "artifacts"
         self.modules_dir = self.root / "modules"
+        self.system_contracts_dir = self.root / "system_contracts"
+        self.service_contracts_dir = self.root / "service_contracts"
+        self.class_contracts_dir = self.root / "class_contracts"
         self.code_index_dir = self.root / "code_index"
         self.debates_dir = self.root / "debates"
         self.context_packs_dir = self.root / "context_packs"
@@ -125,6 +76,9 @@ class FactoryStateStore:
             self.tasks_dir,
             self.artifacts_dir,
             self.modules_dir,
+            self.system_contracts_dir,
+            self.service_contracts_dir,
+            self.class_contracts_dir,
             self.code_index_dir,
             self.debates_dir,
             self.context_packs_dir,
@@ -204,6 +158,27 @@ class FactoryStateStore:
             artifact_id=plan.micro_plan_id,
             payload=plan.model_dump(mode="json"),
         )
+
+    def write_system_contract(self, contract: SystemContract) -> Path:
+        contract_dir = self.system_contracts_dir / contract.system_id / contract.system_version
+        contract_dir.mkdir(parents=True, exist_ok=True)
+        path = contract_dir / "contract.json"
+        path.write_text(contract.model_dump_json(indent=2), encoding="utf-8")
+        return path
+
+    def write_service_contract(self, contract: ServiceContract) -> Path:
+        contract_dir = self.service_contracts_dir / contract.service_id / contract.service_version
+        contract_dir.mkdir(parents=True, exist_ok=True)
+        path = contract_dir / "contract.json"
+        path.write_text(contract.model_dump_json(indent=2), encoding="utf-8")
+        return path
+
+    def write_class_contract(self, contract: ClassContract) -> Path:
+        contract_dir = self.class_contracts_dir / contract.class_id / contract.class_version
+        contract_dir.mkdir(parents=True, exist_ok=True)
+        path = contract_dir / "contract.json"
+        path.write_text(contract.model_dump_json(indent=2), encoding="utf-8")
+        return path
 
     def write_module_contract(self, contract: MicroModuleContract) -> Path:
         module_dir = self.modules_dir / contract.module_id / contract.module_version

@@ -15,7 +15,7 @@ from deepagents.backends.protocol import (
     WriteResult,
 )
 
-from .models import ContextAccessLevel, ContextPack
+from .models import BoundaryLevel, ContextAccessLevel, ContextPack
 
 
 SEALED_ACCESS_ERROR_TEMPLATE = (
@@ -71,6 +71,27 @@ def _is_sealed_implementation_path(path: Path) -> bool:
 
 def _is_allowed_public_surface(path: Path) -> bool:
     return path.name in {"contract.json", "examples.md", "ship.json", "envelope.json"}
+
+
+def _contract_scope_for_path(file_path: str) -> tuple[BoundaryLevel | None, str | None]:
+    parts = [part for part in Path(file_path).parts if part not in {"/", ""}]
+    if "system_contracts" in parts:
+        idx = parts.index("system_contracts")
+        if len(parts) > idx + 2:
+            return BoundaryLevel.L2_SYSTEM, f"{parts[idx + 1]}@{parts[idx + 2]}"
+    if "service_contracts" in parts:
+        idx = parts.index("service_contracts")
+        if len(parts) > idx + 2:
+            return BoundaryLevel.L3_SERVICE, f"{parts[idx + 1]}@{parts[idx + 2]}"
+    if "modules" in parts:
+        idx = parts.index("modules")
+        if len(parts) > idx + 2:
+            return BoundaryLevel.L4_COMPONENT, f"{parts[idx + 1]}@{parts[idx + 2]}"
+    if "class_contracts" in parts:
+        idx = parts.index("class_contracts")
+        if len(parts) > idx + 2:
+            return BoundaryLevel.L5_CLASS, f"{parts[idx + 1]}@{parts[idx + 2]}"
+    return None, None
 
 
 class ImmutableArtifactBackend(BackendProtocol):
@@ -229,7 +250,20 @@ class ContextPackBackend(BackendProtocol):
         self._context_pack = context_pack
 
     def _allowed(self, file_path: str) -> bool:
-        level = self._context_pack.access_for_path(file_path)
+        boundary_level, contract_ref = _contract_scope_for_path(file_path)
+        path_permissions = self._context_pack.matching_permissions_for_path(file_path)
+        scoped_permissions = self._context_pack.matching_permissions_for_ref(
+            level=boundary_level,
+            contract_ref=contract_ref,
+            path=file_path,
+        )
+        if scoped_permissions:
+            level = scoped_permissions[0].access_level
+        elif any(permission.level is not None for permission in path_permissions):
+            # Level-aware permissions are strict; no scoped match means deny.
+            return False
+        else:
+            level = self._context_pack.access_for_path(file_path)
         path = Path(file_path)
         if level == ContextAccessLevel.FULL:
             return True
@@ -242,8 +276,14 @@ class ContextPackBackend(BackendProtocol):
         return False
 
     def _deny_message(self, file_path: str) -> str:
-        level = self._context_pack.access_for_path(file_path).value
-        return f"Access denied by context pack {self._context_pack.cp_id}: {file_path} requires higher than {level}"
+        access = self._context_pack.access_for_path(file_path).value
+        boundary_level, contract_ref = _contract_scope_for_path(file_path)
+        boundary_note = boundary_level.value if boundary_level is not None else "UNSCOPED"
+        ref_note = contract_ref if contract_ref is not None else "N/A"
+        return (
+            f"Access denied by context pack {self._context_pack.cp_id}: {file_path} "
+            f"(level={boundary_note}, contract_ref={ref_note}) requires higher than {access}"
+        )
 
     def ls_info(self, path: str) -> list[FileInfo]:
         infos = self._backend.ls_info(path)

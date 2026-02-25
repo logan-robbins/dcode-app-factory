@@ -22,6 +22,7 @@ class RuntimeSettings:
     recursion_limit: int = 1_000
     checkpoint_db: str = "state_store/checkpoints/langgraph.sqlite"
     debate_use_llm: bool = True
+    class_contract_policy: str = "selective_shared"
 
     @classmethod
     def from_env(cls) -> "RuntimeSettings":
@@ -39,6 +40,7 @@ class RuntimeSettings:
             recursion_limit=_get_env_int("FACTORY_RECURSION_LIMIT", default=1_000, minimum=100),
             checkpoint_db=os.getenv("FACTORY_CHECKPOINT_DB", "state_store/checkpoints/langgraph.sqlite"),
             debate_use_llm=_get_env_bool("FACTORY_DEBATE_USE_LLM", default=True),
+            class_contract_policy=os.getenv("FACTORY_CLASS_CONTRACT_POLICY", "selective_shared"),
         ).normalized()
 
     def normalized(self) -> "RuntimeSettings":
@@ -46,6 +48,11 @@ class RuntimeSettings:
         embedding_model = self.embedding_model.strip()
         if not embedding_model:
             raise ValueError("FACTORY_EMBEDDING_MODEL must be non-empty")
+        class_contract_policy = self.class_contract_policy.strip().lower()
+        if class_contract_policy not in {"selective_shared", "universal_public", "service_only"}:
+            raise ValueError(
+                "FACTORY_CLASS_CONTRACT_POLICY must be one of: selective_shared, universal_public, service_only"
+            )
         return RuntimeSettings(
             max_product_sections=self.max_product_sections,
             context_budget_floor_tokens=self.context_budget_floor_tokens,
@@ -60,6 +67,7 @@ class RuntimeSettings:
             recursion_limit=self.recursion_limit,
             checkpoint_db=self.checkpoint_db,
             debate_use_llm=self.debate_use_llm,
+            class_contract_policy=class_contract_policy,
         )
 
     def default_spec_file(self, repo_root: Path) -> Path:

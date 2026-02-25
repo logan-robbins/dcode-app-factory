@@ -118,6 +118,19 @@ class ContextAccessLevel(StrEnum):
     METADATA_ONLY = "METADATA_ONLY"
 
 
+class BoundaryLevel(StrEnum):
+    L1_FUNCTIONAL = "L1_FUNCTIONAL"
+    L2_SYSTEM = "L2_SYSTEM"
+    L3_SERVICE = "L3_SERVICE"
+    L4_COMPONENT = "L4_COMPONENT"
+    L5_CLASS = "L5_CLASS"
+
+
+class ContractCompatibility(StrEnum):
+    NON_BREAKING = "NON_BREAKING"
+    BREAKING_MAJOR = "BREAKING_MAJOR"
+
+
 class InterfaceChangeType(StrEnum):
     CANNOT_SUPPORT = "CANNOT_SUPPORT"
     AMBIGUOUS = "AMBIGUOUS"
@@ -284,11 +297,6 @@ class ProductSpec(BaseModel):
             for task in story.tasks
         ]
 
-
-class StructuredSpec(ProductSpec):
-    """Backward-compatible alias used by prior code paths."""
-
-
 class ProjectTaskState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -298,6 +306,9 @@ class ProjectTaskState(BaseModel):
     task: str
     status: TaskStatus
     depends_on: list[str] = Field(default_factory=list)
+    service_refs: list[str] = Field(default_factory=list)
+    component_refs: list[str] = Field(default_factory=list)
+    class_refs: list[str] = Field(default_factory=list)
     module_ref: str | None = None
     module_refs: list[str] = Field(default_factory=list)
     shipped_at: datetime | None = None
@@ -339,6 +350,14 @@ class ContextPermission(BaseModel):
 
     path: str
     access_level: ContextAccessLevel
+    level: BoundaryLevel | None = None
+    contract_ref: str | None = None
+
+    @model_validator(mode="after")
+    def validate_contract_ref_requires_level(self) -> "ContextPermission":
+        if self.contract_ref is not None and self.level is None:
+            raise ValueError("ContextPermission.contract_ref requires level")
+        return self
 
 
 class ContextPack(BaseModel):
@@ -353,13 +372,46 @@ class ContextPack(BaseModel):
     required_sections: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
-    def access_for_path(self, path: str) -> ContextAccessLevel:
+    def matching_permissions_for_path(self, path: str) -> list[ContextPermission]:
         normalized = path.rstrip("/")
+        matches: list[ContextPermission] = []
         for permission in self.permissions:
             allowed = permission.path.rstrip("/")
             if normalized == allowed or normalized.startswith(f"{allowed}/"):
-                return permission.access_level
+                matches.append(permission)
+        return matches
+
+    def access_for_path(self, path: str) -> ContextAccessLevel:
+        matches = self.matching_permissions_for_path(path)
+        if matches:
+            matches.sort(key=lambda item: len(item.path), reverse=True)
+            return matches[0].access_level
         return ContextAccessLevel.CONTRACT_ONLY
+
+    def matching_permissions_for_ref(
+        self,
+        *,
+        level: BoundaryLevel | None,
+        contract_ref: str | None,
+        path: str,
+    ) -> list[ContextPermission]:
+        matched = self.matching_permissions_for_path(path)
+        if level is None:
+            return [permission for permission in matched if permission.level is None]
+
+        scoped: list[ContextPermission] = []
+        for permission in matched:
+            if permission.level is not None and permission.level != level:
+                continue
+            if permission.contract_ref is not None and contract_ref is not None and permission.contract_ref != contract_ref:
+                continue
+            if permission.contract_ref is not None and contract_ref is None:
+                continue
+            scoped.append(permission)
+        if scoped:
+            scoped.sort(key=lambda item: len(item.path), reverse=True)
+            return scoped
+        return []
 
 
 class ContractInput(BaseModel):
@@ -439,6 +491,98 @@ class RuntimeBudgets(BaseModel):
     memory_mb_max: float | None = None
 
 
+class SystemContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    system_id: str = Field(pattern=r"^SYS-[a-zA-Z0-9-]+$")
+    system_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+    name: str
+    purpose: str
+    parent_task_ref: str
+    functional_contract_ref: str
+    service_refs: list[str] = Field(min_length=1)
+    owner: str = Field(min_length=1)
+    compatibility_type: ContractCompatibility = ContractCompatibility.NON_BREAKING
+    status: ArtifactStatus = ArtifactStatus.DRAFT
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class ServiceContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    service_id: str = Field(pattern=r"^SVC-[a-zA-Z0-9-]+$")
+    service_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+    name: str
+    purpose: str
+    parent_task_ref: str
+    owner: str = Field(min_length=1)
+    component_refs: list[str] = Field(default_factory=list)
+    inputs: list[str] = Field(min_length=1)
+    outputs: list[str] = Field(min_length=1)
+    error_surfaces: list[str] = Field(default_factory=list)
+    effects: list[str] = Field(default_factory=list)
+    modes: list[str] = Field(default_factory=list)
+    compatibility_type: ContractCompatibility = ContractCompatibility.NON_BREAKING
+    status: ArtifactStatus = ArtifactStatus.DRAFT
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @computed_field(return_type=str)
+    @property
+    def interface_fingerprint(self) -> str:
+        payload = {
+            "inputs": self.inputs,
+            "outputs": self.outputs,
+            "error_surfaces": self.error_surfaces,
+            "effects": self.effects,
+            "modes": self.modes,
+        }
+        canonical = to_canonical_json(payload)
+        import hashlib
+
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class ClassMethodContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    inputs: list[str] = Field(default_factory=list)
+    outputs: list[str] = Field(default_factory=list)
+    raises: list[str] = Field(default_factory=list)
+
+
+class ClassContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    class_id: str = Field(pattern=r"^CLS-[a-zA-Z0-9-]+$")
+    class_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+    name: str
+    purpose: str
+    parent_task_ref: str
+    component_ref: str
+    owner: str = Field(min_length=1)
+    shared: bool = True
+    methods: list[ClassMethodContract] = Field(min_length=1)
+    invariants: list[str] = Field(default_factory=list)
+    error_surfaces: list[str] = Field(default_factory=list)
+    compatibility_type: ContractCompatibility = ContractCompatibility.NON_BREAKING
+    status: ArtifactStatus = ArtifactStatus.DRAFT
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @computed_field(return_type=str)
+    @property
+    def interface_fingerprint(self) -> str:
+        payload = {
+            "methods": [entry.model_dump(mode="json") for entry in self.methods],
+            "invariants": self.invariants,
+            "error_surfaces": self.error_surfaces,
+        }
+        canonical = to_canonical_json(payload)
+        import hashlib
+
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class MicroModuleContract(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
@@ -462,6 +606,17 @@ class MicroModuleContract(BaseModel):
     dependencies: list[DependencyRef] = Field(default_factory=list)
     compatibility: CompatibilityRule
     runtime_budgets: RuntimeBudgets = Field(default_factory=RuntimeBudgets)
+    level: BoundaryLevel = BoundaryLevel.L4_COMPONENT
+    owner: str = "engineering_loop"
+    service_ref: str | None = None
+    class_contract_refs: list[str] = Field(default_factory=list)
+    compatibility_type: ContractCompatibility = ContractCompatibility.NON_BREAKING
+
+    @model_validator(mode="after")
+    def validate_level(self) -> "MicroModuleContract":
+        if self.level != BoundaryLevel.L4_COMPONENT:
+            raise ValueError("MicroModuleContract level must be L4_COMPONENT")
+        return self
 
     @computed_field(return_type=str)
     @property
@@ -477,6 +632,10 @@ class MicroModuleContract(BaseModel):
         import hashlib
 
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class ComponentContract(MicroModuleContract):
+    """Canonical L4 contract type."""
 
 
 class ShipVerification(BaseModel):
@@ -525,14 +684,17 @@ class CodeIndexEntry(BaseModel):
     module_ref: str
     module_id: str
     version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+    level: BoundaryLevel = BoundaryLevel.L4_COMPONENT
     name: str
     purpose: str
+    owner: str = "engineering_loop"
     tags: list[str] = Field(default_factory=list)
     contract_ref: str
     examples_ref: str
     ship_ref: str
     io_summary: CodeIndexIoSummary
     dependencies: list[str] = Field(default_factory=list)
+    compatibility_type: ContractCompatibility = ContractCompatibility.NON_BREAKING
     status: CodeIndexStatus = CodeIndexStatus.CURRENT
     superseded_by: str | None = None
     deprecation_reason: str | None = None
@@ -577,6 +739,10 @@ class MicroPlanModule(BaseModel):
     module_id: str = Field(pattern=r"^MM-[a-zA-Z0-9-]+$")
     name: str
     purpose: str
+    level: BoundaryLevel = BoundaryLevel.L4_COMPONENT
+    owner: str = "engineering_loop"
+    service_ref: str | None = None
+    class_contract_refs: list[str] = Field(default_factory=list)
     io_contract: MicroIoContract
     error_cases: list[str] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list)
@@ -591,6 +757,9 @@ class MicroPlan(BaseModel):
 
     micro_plan_id: str = Field(pattern=r"^MP-[0-9a-f]{8}$")
     parent_task_ref: str
+    system_contract_ref: str | None = None
+    service_contract_refs: list[str] = Field(default_factory=list)
+    class_contract_refs: list[str] = Field(default_factory=list)
     modules: list[MicroPlanModule] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -623,6 +792,10 @@ class MicroPlan(BaseModel):
         if seen != len(self.modules):
             raise ValueError("micro plan depends_on graph contains a cycle")
         return self
+
+
+class FractalPlan(MicroPlan):
+    """Canonical level-aware plan artifact."""
 
 
 class Proposal(BaseModel):

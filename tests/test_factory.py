@@ -37,9 +37,11 @@ from dcode_app_factory.debate import DebateGraph, DebateResult
 from dcode_app_factory.llm import get_structured_chat_model, normalize_structured_output
 from dcode_app_factory.loops import ReleaseLoop
 from dcode_app_factory.models import (
+    BoundaryLevel,
     ChallengeFailure,
     AdjudicationDecision,
     CompatibilityExpectation,
+    ContractCompatibility,
     CompatibilityRule,
     ContractErrorSurface,
     ContractInput,
@@ -239,6 +241,37 @@ def test_context_pack_backend_contract_only_enforcement(tmp_path: Path) -> None:
     assert "{}" in wrapped.read("/modules/MM-1/1.0.0/contract.json")
 
 
+def test_context_pack_backend_contract_ref_scoping(tmp_path: Path) -> None:
+    backend = FilesystemBackend(root_dir=tmp_path, virtual_mode=True)
+    first = tmp_path / "modules" / "MM-1" / "1.0.0"
+    second = tmp_path / "modules" / "MM-2" / "1.0.0"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "contract.json").write_text("{\"id\":\"MM-1\"}", encoding="utf-8")
+    (second / "contract.json").write_text("{\"id\":\"MM-2\"}", encoding="utf-8")
+
+    cp = ContextPack(
+        cp_id="CP-8765abcd",
+        task_id="T-a-b-c-1",
+        role="challenger",
+        objective="review one module contract",
+        permissions=[
+            ContextPermission(
+                path="/modules",
+                access_level=ContextAccessLevel.CONTRACT_ONLY,
+                level=BoundaryLevel.L4_COMPONENT,
+                contract_ref="MM-1@1.0.0",
+            )
+        ],
+        context_budget_tokens=2000,
+        required_sections=["contract"],
+    )
+    wrapped = ContextPackBackend(backend, cp)
+    assert "MM-1" in wrapped.read("/modules/MM-1/1.0.0/contract.json")
+    denied = wrapped.read("/modules/MM-2/1.0.0/contract.json")
+    assert "Access denied by context pack" in denied
+
+
 def test_opaque_backend_returns_required_error_format(tmp_path: Path) -> None:
     backend = FilesystemBackend(root_dir=tmp_path, virtual_mode=True)
     version_dir = tmp_path / "modules" / "MM-opaque" / "1.0.0"
@@ -378,6 +411,37 @@ def test_code_index_append_only_search_and_reindex(tmp_path: Path) -> None:
     assert index.reindex() >= 1
 
 
+def test_code_index_records_level_owner_and_compatibility(tmp_path: Path) -> None:
+    index = CodeIndex(tmp_path)
+    contract = MicroModuleContract(
+        module_id="MM-owner",
+        module_version="1.0.0",
+        name="Owner Module",
+        purpose="Tracks level-aware metadata",
+        tags=["ownership"],
+        owner="team-platform",
+        compatibility_type=ContractCompatibility.NON_BREAKING,
+        examples_ref="/modules/MM-owner/1.0.0/examples.md",
+        created_by="tester",
+        inputs=[ContractInput(name="request", type="dict", constraints=["non-empty"])],
+        outputs=[ContractOutput(name="response", type="dict", invariants=["deterministic"])],
+        error_surfaces=[ContractErrorSurface(name="ValidationError", when="bad request", surface="exception")],
+        effects=[{"type": EffectType.WRITE, "target": "state_store", "description": "writes artifacts"}],
+        modes=ContractModes(sync=True, **{"async": False}, notes="sync"),
+        error_cases=["bad request"],
+        dependencies=[],
+        compatibility=CompatibilityRule(backward_compatible_with=[], breaking_change_policy="major"),
+        runtime_budgets=RuntimeBudgets(latency_ms_p95=15, memory_mb_max=64),
+        status=ArtifactStatus.DRAFT,
+    )
+    index.register(contract)
+    entry = index.get_entry("MM-owner@1.0.0")
+    assert entry is not None
+    assert entry.level == BoundaryLevel.L4_COMPONENT
+    assert entry.owner == "team-platform"
+    assert entry.compatibility_type == ContractCompatibility.NON_BREAKING
+
+
 def test_code_index_reindexes_when_embedding_model_changes(tmp_path: Path) -> None:
     index = CodeIndex(tmp_path, embedding_model="deterministic-hash-96")
     contract = MicroModuleContract(
@@ -444,6 +508,12 @@ def test_runtime_settings_default_embedding_model_is_openai(monkeypatch: pytest.
     monkeypatch.delenv("FACTORY_EMBEDDING_MODEL", raising=False)
     settings = RuntimeSettings.from_env()
     assert settings.embedding_model == "text-embedding-3-large"
+
+
+def test_runtime_settings_default_class_contract_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FACTORY_CLASS_CONTRACT_POLICY", raising=False)
+    settings = RuntimeSettings.from_env()
+    assert settings.class_contract_policy == "selective_shared"
 
 
 def test_normalize_structured_output_accepts_include_raw_shape() -> None:
@@ -662,6 +732,38 @@ def test_project_loop_happy_path_with_mocked_debate(monkeypatch: pytest.MonkeyPa
     assert state.project_id == settings.project_id
 
 
+def test_project_loop_emits_levelled_contract_artifacts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("dcode_app_factory.loops.ProductLoop._invoke_deep_agent", lambda self, spec_json_path: None)
+    monkeypatch.setattr("dcode_app_factory.loops.DebateGraph", _FakeDebateGraphPass)
+
+    settings = RuntimeSettings(
+        state_store_root=str(tmp_path),
+        project_id="ACME-LVL-001",
+        debate_use_llm=False,
+        embedding_model="deterministic-hash-384",
+        class_contract_policy="selective_shared",
+    )
+    spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
+    project = ProjectLoop(
+        spec,
+        CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index"),
+        state_store_root=tmp_path,
+        settings=settings,
+        enable_interrupts=False,
+    )
+    assert project.run() is True
+
+    assert any(project.state_store.system_contracts_dir.rglob("contract.json"))
+    assert any(project.state_store.service_contracts_dir.rglob("contract.json"))
+    assert any(project.state_store.class_contracts_dir.rglob("contract.json"))
+
+    state = project.state_store.read_project_state()
+    shipped = [entry for entry in state.tasks.values() if entry.status == TaskStatus.SHIPPED]
+    assert shipped
+    assert all(entry.service_refs for entry in shipped)
+    assert all(entry.component_refs for entry in shipped)
+
+
 def test_project_loop_halt_blocks_downstream(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr("dcode_app_factory.loops.ProductLoop._invoke_deep_agent", lambda self, spec_json_path: None)
     monkeypatch.setattr("dcode_app_factory.loops.DebateGraph", _FakeDebateGraphFailFirst)
@@ -708,6 +810,37 @@ def test_release_loop_flags_deprecated_dependency(monkeypatch: pytest.MonkeyPatc
     release = ReleaseLoop(state_store=project.state_store, code_index=code_index, spec=spec)
     result = release.run()
     assert result["integration_gates"]["deprecation_check"] == "FAIL"
+
+
+def test_release_loop_includes_new_contract_and_context_gates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr("dcode_app_factory.loops.ProductLoop._invoke_deep_agent", lambda self, spec_json_path: None)
+    monkeypatch.setattr("dcode_app_factory.loops.DebateGraph", _FakeDebateGraphPass)
+
+    settings = RuntimeSettings(
+        state_store_root=str(tmp_path),
+        project_id="ACME-REL-GATES",
+        debate_use_llm=False,
+        embedding_model="deterministic-hash-384",
+    )
+    spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
+    code_index = CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index")
+    project = ProjectLoop(spec, code_index, state_store_root=tmp_path, settings=settings, enable_interrupts=False)
+    assert project.run() is True
+
+    release = ReleaseLoop(state_store=project.state_store, code_index=code_index, spec=spec)
+    result = release.run()
+    gates = result["integration_gates"]
+    assert "contract_completeness_check" in gates
+    assert "compatibility_check" in gates
+    assert "ownership_check" in gates
+    assert "context_pack_compliance_check" in gates
+    assert gates["contract_completeness_check"] == "PASS"
+    assert gates["compatibility_check"] == "PASS"
+    assert gates["ownership_check"] == "PASS"
+    assert gates["context_pack_compliance_check"] == "PASS"
 
 
 def test_release_loop_expands_transitive_dependencies(tmp_path: Path) -> None:

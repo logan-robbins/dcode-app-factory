@@ -13,12 +13,12 @@ from chromadb.utils import embedding_functions
 
 from .llm import ensure_openai_api_key
 from .models import (
+    BoundaryLevel,
     CodeIndexEntry,
     CodeIndexIoSummary,
     CodeIndexStatus,
     MicroModuleContract,
 )
-from .settings import RuntimeSettings
 from .utils import slugify_name
 
 
@@ -96,7 +96,7 @@ class CodeIndexSearchResult:
     similarity_score: float
 
 
-class AppendOnlyCodeIndex:
+class CodeIndex:
     """Append-only Chroma-backed code index with semantic and metadata search."""
 
     def __init__(self, root: Path, *, embedding_model: str = "text-embedding-3-large") -> None:
@@ -167,9 +167,12 @@ class AppendOnlyCodeIndex:
         return {
             "module_id": entry.module_id,
             "version": entry.version,
+            "level": entry.level.value,
             "status": entry.status.value,
             "name": entry.name,
             "purpose": entry.purpose,
+            "owner": entry.owner,
+            "compatibility_type": entry.compatibility_type.value,
             "tags": json.dumps(entry.tags),
             "dependencies": json.dumps(entry.dependencies),
             "io_inputs": json.dumps(entry.io_summary.inputs),
@@ -217,9 +220,12 @@ class AppendOnlyCodeIndex:
         tags: list[str] | None,
         input_types: list[str] | None,
         output_types: list[str] | None,
+        level: BoundaryLevel | None,
         include_inactive: bool,
     ) -> bool:
         if not include_inactive and entry.status in {CodeIndexStatus.DEPRECATED, CodeIndexStatus.SUPERSEDED}:
+            return False
+        if level is not None and entry.level != level:
             return False
         if tags and not set(tags).intersection(set(entry.tags)):
             return False
@@ -233,6 +239,7 @@ class AppendOnlyCodeIndex:
         self,
         query: str,
         *,
+        level: BoundaryLevel | None = None,
         tags: list[str] | None = None,
         input_types: list[str] | None = None,
         output_types: list[str] | None = None,
@@ -252,6 +259,7 @@ class AppendOnlyCodeIndex:
             entry = CodeIndexEntry.model_validate_json(str(metadata["raw_entry"]))
             if not self._matches_filters(
                 entry,
+                level=level,
                 tags=tags,
                 input_types=input_types,
                 output_types=output_types,
@@ -337,23 +345,16 @@ class AppendOnlyCodeIndex:
         entries.sort(key=lambda entry: entry.module_ref)
         return entries
 
-
-class CodeIndex:
-    """Compatibility wrapper preserving old API while using AppendOnlyCodeIndex."""
-
-    def __init__(self, root: Path | None = None, *, embedding_model: str | None = None) -> None:
-        self.root = root if root is not None else Path("state_store") / "code_index"
-        model = embedding_model if embedding_model is not None else RuntimeSettings.from_env().embedding_model
-        self._index = AppendOnlyCodeIndex(self.root, embedding_model=model)
-
     def register(self, contract: MicroModuleContract) -> str:
         module_ref = f"{contract.module_id}@{contract.module_version}"
         entry = CodeIndexEntry(
             module_ref=module_ref,
             module_id=contract.module_id,
             version=contract.module_version,
+            level=BoundaryLevel.L4_COMPONENT,
             name=contract.name,
             purpose=contract.purpose,
+            owner=contract.owner,
             tags=list(contract.tags),
             contract_ref=f"/modules/{contract.module_id}/{contract.module_version}/contract.json",
             examples_ref=contract.examples_ref,
@@ -369,43 +370,23 @@ class CodeIndex:
                 ],
             ),
             dependencies=[item.ref for item in contract.dependencies],
+            compatibility_type=contract.compatibility_type,
             status=CodeIndexStatus.CURRENT,
             notes="",
         )
-        self._index.add_entry(entry)
+        self.add_entry(entry)
         return slugify_name(contract.name)
 
     def get(self, name_or_slug: str) -> MicroModuleContract | None:
-        # Compatibility layer intentionally does not rehydrate contracts from index metadata.
         _ = name_or_slug
         return None
-
-    def search(self, query: str, **kwargs: object) -> list[CodeIndexSearchResult]:
-        return self._index.search(query, **kwargs)
-
-    def get_entry(self, module_ref: str) -> CodeIndexEntry | None:
-        return self._index.get_entry(module_ref)
-
-    def set_status(self, module_ref: str, *, status: CodeIndexStatus, superseded_by: str | None = None, deprecation_reason: str | None = None) -> CodeIndexEntry:
-        return self._index.set_status(
-            module_ref,
-            status=status,
-            superseded_by=superseded_by,
-            deprecation_reason=deprecation_reason,
-        )
-
-    def reindex(self) -> int:
-        return self._index.reindex()
-
-    def list_entries(self) -> list[CodeIndexEntry]:
-        return self._index.list_entries()
 
     def items(self) -> list[tuple[str, MicroModuleContract]]:
         return []
 
     def __len__(self) -> int:
-        return len(self._index.list_entries())
+        return len(self.list_entries())
 
     def iter_refs(self) -> Iterable[str]:
-        for entry in self._index.list_entries():
+        for entry in self.list_entries():
             yield entry.module_ref

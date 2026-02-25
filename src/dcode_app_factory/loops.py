@@ -25,11 +25,16 @@ from .models import (
     ArtifactStatus,
     ArtifactType,
     Challenge,
+    ClassContract,
+    ClassMethodContract,
+    BoundaryLevel,
     CodeIndexStatus,
-    CompatibilityExpectation,
+    ContractCompatibility,
     ContextAccessLevel,
+    ContextPack,
     EscalationArtifact,
     FailedInvariant,
+    FractalPlan,
     HumanResolution,
     HumanResolutionAction,
     InterfaceChangeException,
@@ -49,7 +54,9 @@ from .models import (
     ShipEvidence,
     ShipVerification,
     SplitTaskInput,
-    StructuredSpec,
+    ProductSpec,
+    ServiceContract,
+    SystemContract,
     Task,
     TaskStatus,
 )
@@ -118,7 +125,7 @@ class ProductLoop:
             config={"configurable": {"thread_id": f"product-loop-{uuid.uuid4().hex[:8]}"}},
         )
 
-    def run(self) -> StructuredSpec:
+    def run(self) -> ProductSpec:
         spec = parse_raw_spec_to_product_spec(self.raw_spec)
         apply_canonical_task_ids(spec)
 
@@ -151,6 +158,9 @@ class EngineeringState(TypedDict, total=False):
     task: dict[str, Any]
     task_id: str
     micro_plan: dict[str, Any]
+    system_contract_ref: str | None
+    service_contract_refs: list[str]
+    class_contract_refs: list[str]
     module_order: list[str]
     module_cursor: int
     module_status: dict[str, str]
@@ -167,6 +177,8 @@ class EngineeringState(TypedDict, total=False):
 class EngineeringResult:
     task_status: TaskStatus
     module_refs: list[str]
+    service_refs: list[str]
+    class_refs: list[str]
     escalation_id: str | None = None
     halt_reason: str | None = None
 
@@ -176,8 +188,8 @@ class EngineeringLoop:
 
     _ATOMIC_SPLIT_RE = re.compile(r"\s*(?:,|;|\band\b|\bthen\b|\bwith\b|\bwhile\b|\bplus\b)\s*", re.IGNORECASE)
     _TOKEN_RE = re.compile(r"[a-z0-9]{3,}")
-    _REUSE_SCORE_THRESHOLD = 0.55
-    _REUSE_TOKEN_OVERLAP_THRESHOLD = 1
+    _REUSE_SCORE_THRESHOLD = 0.25
+    _REUSE_TOKEN_OVERLAP_THRESHOLD = 0
     _STAGE_ORDER = {
         "ingress": 0,
         "core": 1,
@@ -455,7 +467,108 @@ class EngineeringLoop:
             modes=["sync", "verification"],
         )
 
-    def _build_micro_plan(self, task: Task) -> MicroPlan:
+    @staticmethod
+    def _task_slug(task: Task) -> str:
+        return re.sub(r"[^a-z0-9-]+", "-", task.task_id.lower()).strip("-")
+
+    def _service_id_for_task(self, task: Task) -> str:
+        return f"SVC-{self._task_slug(task)}"
+
+    def _service_ref_for_task(self, task: Task) -> str:
+        return f"{self._service_id_for_task(task)}@1.0.0"
+
+    def _system_id_for_task(self, task: Task) -> str:
+        return f"SYS-{self._task_slug(task)}"
+
+    def _system_ref_for_task(self, task: Task) -> str:
+        return f"{self._system_id_for_task(task)}@1.0.0"
+
+    def _class_contract_required(self, module: MicroPlanModule) -> bool:
+        policy = self.settings.class_contract_policy
+        if policy == "service_only":
+            return False
+        if policy == "universal_public":
+            return True
+        stage_match = re.search(r"\[([a-z]+)-\d+\]$", module.name.lower())
+        stage = stage_match.group(1) if stage_match else "core"
+        return stage in {"core", "integration", "verification"}
+
+    def _build_system_contract(self, task: Task) -> SystemContract:
+        return SystemContract(
+            system_id=self._system_id_for_task(task),
+            system_version="1.0.0",
+            name=f"{task.name} System",
+            purpose=f"Top-level bounded context for task {task.task_id}",
+            parent_task_ref=task.task_id,
+            functional_contract_ref=f"/tasks/{task.task_id}.md",
+            service_refs=[self._service_ref_for_task(task)],
+            owner="engineering_loop",
+            compatibility_type=ContractCompatibility.NON_BREAKING,
+            status=ArtifactStatus.SHIPPED,
+        )
+
+    def _build_service_contract(self, task: Task, plan: FractalPlan) -> ServiceContract:
+        return ServiceContract(
+            service_id=self._service_id_for_task(task),
+            service_version="1.0.0",
+            name=f"{task.name} Service",
+            purpose=f"L3 service API for task {task.task_id}",
+            parent_task_ref=task.task_id,
+            owner="engineering_loop",
+            component_refs=[f"{module.module_id}@1.0.0" for module in plan.modules],
+            inputs=[task.io_contract_sketch.inputs],
+            outputs=[task.io_contract_sketch.outputs],
+            error_surfaces=[task.io_contract_sketch.error_surfaces],
+            effects=[task.io_contract_sketch.effects],
+            modes=[task.io_contract_sketch.modes],
+            compatibility_type=ContractCompatibility.NON_BREAKING,
+            status=ArtifactStatus.SHIPPED,
+        )
+
+    def _build_class_contracts(self, task: Task, plan: FractalPlan) -> list[ClassContract]:
+        contracts: list[ClassContract] = []
+        emitted_ids: set[str] = set()
+        for module in plan.modules:
+            if not self._class_contract_required(module):
+                continue
+
+            class_id = f"CLS-{module.module_id.lower()}-api"
+            if class_id in emitted_ids:
+                continue
+            emitted_ids.add(class_id)
+
+            class_ref = f"{class_id}@1.0.0"
+            module.class_contract_refs = [class_ref]
+            if class_ref not in plan.class_contract_refs:
+                plan.class_contract_refs.append(class_ref)
+
+            contracts.append(
+                ClassContract(
+                    class_id=class_id,
+                    class_version="1.0.0",
+                    name=f"{module.name} Boundary",
+                    purpose=f"Selective shared class contract for {module.module_id}",
+                    parent_task_ref=task.task_id,
+                    component_ref=f"{module.module_id}@1.0.0",
+                    owner="engineering_loop",
+                    shared=True,
+                    methods=[
+                        ClassMethodContract(
+                            name="execute",
+                            inputs=list(module.io_contract.inputs),
+                            outputs=list(module.io_contract.outputs),
+                            raises=list(module.io_contract.error_surfaces),
+                        )
+                    ],
+                    invariants=list(module.io_contract.outputs),
+                    error_surfaces=list(module.io_contract.error_surfaces),
+                    compatibility_type=ContractCompatibility.NON_BREAKING,
+                    status=ArtifactStatus.SHIPPED,
+                )
+            )
+        return contracts
+
+    def _build_micro_plan(self, task: Task) -> FractalPlan:
         task_slug = re.sub(r"[^a-z0-9-]+", "-", task.task_id.lower()).strip("-")
         atomic_units = self._atomic_units_for_task(task)
         staged_units = [
@@ -496,6 +609,9 @@ class EngineeringLoop:
                     module_id=module_id,
                     name=f"{task.name} [{stage}-{index:02d}]",
                     purpose=unit,
+                    level=BoundaryLevel.L4_COMPONENT,
+                    owner="engineering_loop",
+                    service_ref=self._service_ref_for_task(task),
                     io_contract=io_contract,
                     error_cases=[task.io_contract_sketch.error_surfaces, f"Failure while executing: {unit}"],
                     depends_on=depends_on,
@@ -508,15 +624,25 @@ class EngineeringLoop:
             created_ids.append(module_id)
             stage_index[stage].append(module_id)
 
-        return MicroPlan(
+        return FractalPlan(
             micro_plan_id=f"MP-{uuid.uuid4().hex[:8]}",
             parent_task_ref=task.task_id,
+            system_contract_ref=self._system_ref_for_task(task),
+            service_contract_refs=[self._service_ref_for_task(task)],
             modules=modules,
         )
 
     def _micro_plan_node(self, state: EngineeringState) -> dict[str, Any]:
         task = Task.model_validate(state["task"])
         plan = self._build_micro_plan(task)
+        system_contract = self._build_system_contract(task)
+        service_contract = self._build_service_contract(task, plan)
+        class_contracts = self._build_class_contracts(task, plan)
+
+        self.state_store.write_system_contract(system_contract)
+        self.state_store.write_service_contract(service_contract)
+        for class_contract in class_contracts:
+            self.state_store.write_class_contract(class_contract)
         self.state_store.write_micro_plan(plan)
 
         envelope = ArtifactEnvelope.build(
@@ -530,6 +656,9 @@ class EngineeringLoop:
 
         return {
             "micro_plan": plan.model_dump(mode="json"),
+            "system_contract_ref": plan.system_contract_ref,
+            "service_contract_refs": list(plan.service_contract_refs),
+            "class_contract_refs": list(plan.class_contract_refs),
             "module_order": self._module_topological_order(plan),
             "module_cursor": 0,
             "module_status": {module.module_id: "PENDING" for module in plan.modules},
@@ -544,16 +673,33 @@ class EngineeringLoop:
 
     def _build_context_packs(self, task: Task, module: MicroPlanModule) -> dict[str, str]:
         dependency_permissions = [
-            (f"/modules/{dep}", ContextAccessLevel.CONTRACT_ONLY)
+            (
+                f"/modules/{dep}",
+                ContextAccessLevel.CONTRACT_ONLY,
+                BoundaryLevel.L4_COMPONENT,
+                f"{dep}@1.0.0",
+            )
             for dep in module.depends_on
             if dep.startswith("MM-")
         ]
 
+        module_ref = f"{module.module_id}@1.0.0"
         proposer_cp = build_context_pack(
             task_id=task.task_id,
             objective=f"Implement {module.module_id}",
             role="proposer",
-            permissions=[(f"/modules/{module.module_id}", ContextAccessLevel.FULL)] + dependency_permissions,
+            permissions=[
+                ("/system_contracts", ContextAccessLevel.CONTRACT_ONLY, BoundaryLevel.L2_SYSTEM, self._system_ref_for_task(task)),
+                (
+                    "/service_contracts",
+                    ContextAccessLevel.CONTRACT_ONLY,
+                    BoundaryLevel.L3_SERVICE,
+                    self._service_ref_for_task(task),
+                ),
+                (f"/modules/{module.module_id}", ContextAccessLevel.FULL, BoundaryLevel.L4_COMPONENT, module_ref),
+                ("/class_contracts", ContextAccessLevel.CONTRACT_ONLY, BoundaryLevel.L5_CLASS, None),
+            ]
+            + dependency_permissions,
             context_budget_tokens=self.settings.context_budget_cap_tokens,
             required_sections=["task_contract", "micro_plan", "dependencies"],
         )
@@ -561,7 +707,17 @@ class EngineeringLoop:
             task_id=task.task_id,
             objective=f"Challenge {module.module_id}",
             role="challenger",
-            permissions=[("/modules", ContextAccessLevel.CONTRACT_ONLY)],
+            permissions=[
+                ("/system_contracts", ContextAccessLevel.CONTRACT_ONLY, BoundaryLevel.L2_SYSTEM, self._system_ref_for_task(task)),
+                (
+                    "/service_contracts",
+                    ContextAccessLevel.CONTRACT_ONLY,
+                    BoundaryLevel.L3_SERVICE,
+                    self._service_ref_for_task(task),
+                ),
+                ("/modules", ContextAccessLevel.CONTRACT_ONLY, BoundaryLevel.L4_COMPONENT, None),
+                ("/class_contracts", ContextAccessLevel.CONTRACT_ONLY, BoundaryLevel.L5_CLASS, None),
+            ],
             context_budget_tokens=self.settings.context_budget_floor_tokens,
             required_sections=["task_contract", "proposal", "rubric"],
         )
@@ -569,7 +725,11 @@ class EngineeringLoop:
             task_id=task.task_id,
             objective=f"Adjudicate {module.module_id}",
             role="arbiter",
-            permissions=[("/debates", ContextAccessLevel.SUMMARY_ONLY)],
+            permissions=[
+                ("/debates", ContextAccessLevel.SUMMARY_ONLY),
+                ("/service_contracts", ContextAccessLevel.CONTRACT_ONLY, BoundaryLevel.L3_SERVICE, self._service_ref_for_task(task)),
+                ("/modules", ContextAccessLevel.CONTRACT_ONLY, BoundaryLevel.L4_COMPONENT, None),
+            ],
             context_budget_tokens=self.settings.context_budget_floor_tokens,
             required_sections=["task_context", "proposal", "challenge"],
         )
@@ -679,6 +839,11 @@ class EngineeringLoop:
             status=ArtifactStatus.DRAFT,
             supersedes=None,
             deprecated_by=None,
+            level=BoundaryLevel.L4_COMPONENT,
+            owner=module.owner,
+            service_ref=module.service_ref,
+            class_contract_refs=list(module.class_contract_refs),
+            compatibility_type=ContractCompatibility.NON_BREAKING,
         )
 
     def _next_module_version(self, module_id: str) -> str:
@@ -701,7 +866,7 @@ class EngineeringLoop:
         return f"{major}.{minor}.{patch + 1}"
 
     def _module_step_node(self, state: EngineeringState) -> dict[str, Any] | Command[str]:
-        plan = MicroPlan.model_validate(state["micro_plan"])
+        plan = FractalPlan.model_validate(state["micro_plan"])
         task = Task.model_validate(state["task"])
         cursor = int(state["module_cursor"])
         module_order = list(state["module_order"])
@@ -897,12 +1062,16 @@ class EngineeringLoop:
             return EngineeringResult(
                 task_status=TaskStatus.HALTED,
                 module_refs=list(result.get("module_refs", {}).values()),
+                service_refs=list(result.get("service_contract_refs", [])),
+                class_refs=list(result.get("class_contract_refs", [])),
                 escalation_id=result.get("escalation_id"),
                 halt_reason=result.get("halt_reason"),
             )
         return EngineeringResult(
             task_status=TaskStatus.SHIPPED,
             module_refs=list(result.get("module_refs", {}).values()),
+            service_refs=list(result.get("service_contract_refs", [])),
+            class_refs=list(result.get("class_contract_refs", [])),
         )
 
 
@@ -920,7 +1089,7 @@ class ProjectLoop:
 
     def __init__(
         self,
-        spec: StructuredSpec,
+        spec: ProductSpec,
         code_index: CodeIndex | None = None,
         *,
         state_store_root: str | Path | None = None,
@@ -999,7 +1168,7 @@ class ProjectLoop:
         )
 
     def _init_state_machine_node(self, state: ProjectStateGraphState) -> dict[str, Any]:
-        spec = StructuredSpec.model_validate(state["spec"])
+        spec = ProductSpec.model_validate(state["spec"])
         apply_canonical_task_ids(spec)
         self._task_lookup = {task.task_id: task for task in spec.iter_tasks()}
 
@@ -1053,6 +1222,8 @@ class ProjectLoop:
                 "task_id": task_id,
                 "task_status": result.task_status.value,
                 "module_refs": result.module_refs,
+                "service_refs": result.service_refs,
+                "class_refs": result.class_refs,
                 "escalation_id": result.escalation_id,
                 "halt_reason": result.halt_reason,
             }
@@ -1158,6 +1329,11 @@ class ProjectLoop:
         if status == TaskStatus.SHIPPED:
             task_state.status = TaskStatus.SHIPPED
             shipped_refs = list(result.get("module_refs", []))
+            service_refs = list(result.get("service_refs", []))
+            class_refs = list(result.get("class_refs", []))
+            task_state.service_refs = service_refs
+            task_state.component_refs = shipped_refs
+            task_state.class_refs = class_refs
             task_state.module_refs = shipped_refs
             task_state.module_ref = shipped_refs[0] if shipped_refs else None
             task_state.shipped_at = datetime.now(UTC)
@@ -1230,7 +1406,7 @@ class ReleaseLoopState(TypedDict, total=False):
 class ReleaseLoop:
     """Release stage StateGraph with dependency/fingerprint/deprecation/code-index gates."""
 
-    def __init__(self, *, state_store: FactoryStateStore, code_index: CodeIndex, spec: StructuredSpec) -> None:
+    def __init__(self, *, state_store: FactoryStateStore, code_index: CodeIndex, spec: ProductSpec) -> None:
         self.state_store = state_store
         self.code_index = code_index
         self.spec = spec
@@ -1271,7 +1447,9 @@ class ReleaseLoop:
         for task in state_machine.tasks.values():
             if task.status != TaskStatus.SHIPPED:
                 continue
-            if task.module_refs:
+            if task.component_refs:
+                modules.extend(task.component_refs)
+            elif task.module_refs:
                 modules.extend(task.module_refs)
             elif task.module_ref is not None:
                 modules.append(task.module_ref)
@@ -1281,11 +1459,16 @@ class ReleaseLoop:
     def _gate_check_node(self, state: ReleaseLoopState) -> dict[str, Any]:
         modules = list(state.get("modules", []))
         entries = {entry.module_ref: entry for entry in self.code_index.list_entries()}
+        state_machine = self.state_store.read_project_state()
 
         dependency_pass = True
         fingerprint_pass = True
         deprecation_pass = True
         code_index_pass = True
+        contract_completeness_pass = True
+        compatibility_pass = True
+        ownership_pass = True
+        context_pack_compliance_pass = True
         notes: list[str] = []
 
         for module_ref in modules:
@@ -1300,6 +1483,23 @@ class ReleaseLoop:
             if entry.status in {CodeIndexStatus.DEPRECATED, CodeIndexStatus.SUPERSEDED}:
                 deprecation_pass = False
                 notes.append(f"Module {module_ref} is inactive ({entry.status.value})")
+
+            if not entry.owner.strip():
+                ownership_pass = False
+                notes.append(f"Module {module_ref} missing owner metadata")
+            if entry.compatibility_type == ContractCompatibility.BREAKING_MAJOR:
+                compatibility_pass = False
+                notes.append(f"Module {module_ref} is marked BREAKING_MAJOR")
+
+            contract_path = self.state_store.root / entry.contract_ref.lstrip("/")
+            ship_path = self.state_store.root / entry.ship_ref.lstrip("/")
+            if not contract_path.is_file():
+                contract_completeness_pass = False
+                notes.append(f"Missing contract artifact for {module_ref}: {contract_path}")
+            if not ship_path.is_file():
+                contract_completeness_pass = False
+                notes.append(f"Missing ship artifact for {module_ref}: {ship_path}")
+
             for dep in entry.dependencies:
                 if dep not in modules:
                     dependency_pass = False
@@ -1313,11 +1513,43 @@ class ReleaseLoop:
                     fingerprint_pass = False
                     notes.append(f"Cannot verify dependency fingerprint for {module_ref} -> {dep}")
 
+        if not any(self.state_store.system_contracts_dir.rglob("contract.json")):
+            contract_completeness_pass = False
+            notes.append("Missing L2 system contracts in state store")
+        if not any(self.state_store.service_contracts_dir.rglob("contract.json")):
+            contract_completeness_pass = False
+            notes.append("Missing L3 service contracts in state store")
+
+        for task in state_machine.tasks.values():
+            for class_ref in task.class_refs:
+                class_id, sep, class_version = class_ref.partition("@")
+                if not sep:
+                    contract_completeness_pass = False
+                    notes.append(f"Invalid class_ref format: {class_ref}")
+                    continue
+                class_path = self.state_store.class_contracts_dir / class_id / class_version / "contract.json"
+                if not class_path.is_file():
+                    contract_completeness_pass = False
+                    notes.append(f"Missing class contract for {class_ref}: {class_path}")
+
+        for cp_path in self.state_store.context_packs_dir.glob("*.json"):
+            cp = ContextPack.model_validate_json(cp_path.read_text(encoding="utf-8"))
+            for permission in cp.permissions:
+                if permission.access_level == ContextAccessLevel.CONTRACT_ONLY and permission.level is None:
+                    context_pack_compliance_pass = False
+                    notes.append(
+                        f"Context pack {cp.cp_id} has CONTRACT_ONLY permission without level for path {permission.path}"
+                    )
+
         gates = {
             "dependency_check": "PASS" if dependency_pass else "FAIL",
             "fingerprint_check": "PASS" if fingerprint_pass else "FAIL",
             "deprecation_check": "PASS" if deprecation_pass else "FAIL",
             "code_index_check": "PASS" if code_index_pass else "FAIL",
+            "contract_completeness_check": "PASS" if contract_completeness_pass else "FAIL",
+            "compatibility_check": "PASS" if compatibility_pass else "FAIL",
+            "ownership_check": "PASS" if ownership_pass else "FAIL",
+            "context_pack_compliance_check": "PASS" if context_pack_compliance_pass else "FAIL",
         }
         overall = "PASS" if all(value == "PASS" for value in gates.values()) else "FAIL"
         return {
@@ -1414,7 +1646,7 @@ class FactoryOrchestrator:
         return {"spec": spec.model_dump(mode="json")}
 
     def _approval_gate_node(self, state: OuterGraphState) -> dict[str, Any]:
-        spec = StructuredSpec.model_validate(state["spec"])
+        spec = ProductSpec.model_validate(state["spec"])
         markdown = render_spec_markdown(spec)
         self.state_store.product_spec_md_path.write_text(markdown, encoding="utf-8")
 
@@ -1456,7 +1688,7 @@ class FactoryOrchestrator:
         return "end"
 
     def _project_node(self, state: OuterGraphState) -> dict[str, Any]:
-        spec = StructuredSpec.model_validate(state["spec"])
+        spec = ProductSpec.model_validate(state["spec"])
         loop = ProjectLoop(
             spec,
             self.code_index,
@@ -1471,7 +1703,7 @@ class FactoryOrchestrator:
         return "release_loop" if state.get("project_success") else "end"
 
     def _release_node(self, state: OuterGraphState) -> dict[str, Any]:
-        spec = StructuredSpec.model_validate(state["spec"])
+        spec = ProductSpec.model_validate(state["spec"])
         loop = ReleaseLoop(state_store=self.state_store, code_index=self.code_index, spec=spec)
         result = loop.run()
         return {"release_result": result}

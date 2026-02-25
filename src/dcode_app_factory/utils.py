@@ -9,6 +9,7 @@ from pathlib import Path
 from .canonical import to_canonical_json
 from .models import (
     AgentConfig,
+    BoundaryLevel,
     ContextAccessLevel,
     ContextPack,
     ContextPermission,
@@ -17,7 +18,6 @@ from .models import (
     ProductSpec,
     Severity,
     Story,
-    StructuredSpec,
     Task,
     ValidationIssue,
     ValidationReport,
@@ -62,7 +62,7 @@ def dedupe_slug(base_slug: str, used: set[str], *, max_length: int = 24) -> str:
             raise ValueError(f"unable to disambiguate slug for base '{base_slug}'")
 
 
-def validate_task_dependency_dag(spec: ProductSpec | StructuredSpec) -> None:
+def validate_task_dependency_dag(spec: ProductSpec) -> None:
     tasks = {task.task_id: task for task in spec.iter_tasks()}
     indegree = {task_id: 0 for task_id in tasks}
     edges: dict[str, list[str]] = defaultdict(list)
@@ -88,7 +88,7 @@ def validate_task_dependency_dag(spec: ProductSpec | StructuredSpec) -> None:
         raise ValueError("Task dependency graph contains a cycle")
 
 
-def validate_spec(spec: ProductSpec | StructuredSpec) -> ValidationReport:
+def validate_spec(spec: ProductSpec) -> ValidationReport:
     issues: list[ValidationIssue] = []
 
     if not spec.pillars:
@@ -263,7 +263,7 @@ def validate_spec(spec: ProductSpec | StructuredSpec) -> ValidationReport:
     return report
 
 
-def emit_structured_spec(spec: ProductSpec | StructuredSpec, path: Path) -> Path:
+def emit_structured_spec(spec: ProductSpec, path: Path) -> Path:
     report = validate_spec(spec)
     if report.errors:
         deficiency = "; ".join(f"{entry.path}:{entry.field} {entry.message}" for entry in report.errors)
@@ -273,7 +273,7 @@ def emit_structured_spec(spec: ProductSpec | StructuredSpec, path: Path) -> Path
     return path
 
 
-def render_spec_markdown(spec: ProductSpec | StructuredSpec) -> str:
+def render_spec_markdown(spec: ProductSpec) -> str:
     lines: list[str] = [f"# {spec.title}", "", spec.description, ""]
     for pillar in spec.pillars:
         lines.extend([f"## {pillar.name}", pillar.description, "", f"Rationale: {pillar.rationale}", ""])
@@ -314,7 +314,7 @@ def _extract_sections(raw_spec: str) -> list[str]:
     return sections
 
 
-def parse_raw_spec_to_product_spec(raw_spec: str, *, spec_id: str = "SPEC-001") -> StructuredSpec:
+def parse_raw_spec_to_product_spec(raw_spec: str, *, spec_id: str = "SPEC-001") -> ProductSpec:
     sections = _extract_sections(raw_spec)
     if not sections:
         sections = ["Factory Core", "Project Orchestration", "Engineering Debate"]
@@ -350,7 +350,7 @@ def parse_raw_spec_to_product_spec(raw_spec: str, *, spec_id: str = "SPEC-001") 
         )
 
     now = datetime.now(UTC)
-    spec = StructuredSpec(
+    spec = ProductSpec(
         spec_id=spec_id,
         spec_version="1.0.0",
         title="AI Software Product Factory",
@@ -397,23 +397,42 @@ def build_context_pack(
     task_id: str,
     objective: str,
     role: str,
-    permissions: list[tuple[str, ContextAccessLevel]],
+    permissions: list[
+        tuple[str, ContextAccessLevel]
+        | tuple[str, ContextAccessLevel, BoundaryLevel | None, str | None]
+    ],
     context_budget_tokens: int,
     required_sections: list[str],
 ) -> ContextPack:
     cp_id = f"CP-{to_canonical_json({'task_id': task_id, 'role': role, 'ts': datetime.now(UTC).isoformat()}).encode('utf-8').hex()[:8]}"
+    normalized_permissions: list[ContextPermission] = []
+    for permission in permissions:
+        if len(permission) == 2:
+            path, access_level = permission
+            normalized_permissions.append(ContextPermission(path=path, access_level=access_level))
+            continue
+        path, access_level, level, contract_ref = permission
+        normalized_permissions.append(
+            ContextPermission(
+                path=path,
+                access_level=access_level,
+                level=level,
+                contract_ref=contract_ref,
+            )
+        )
+
     return ContextPack(
         cp_id=cp_id,
         task_id=task_id,
         role=role,
         objective=objective,
-        permissions=[ContextPermission(path=path, access_level=level) for path, level in permissions],
+        permissions=normalized_permissions,
         context_budget_tokens=context_budget_tokens,
         required_sections=required_sections,
     )
 
 
-def resolve_task_ids(spec: ProductSpec | StructuredSpec) -> dict[str, str]:
+def resolve_task_ids(spec: ProductSpec) -> dict[str, str]:
     """Return mapping from old task_id to canonical task ID scheme.
 
     Canonical format: T-{pillar_slug}-{epic_slug}-{story_slug}-{seq}
@@ -441,7 +460,7 @@ def resolve_task_ids(spec: ProductSpec | StructuredSpec) -> dict[str, str]:
     return mapping
 
 
-def apply_canonical_task_ids(spec: ProductSpec | StructuredSpec) -> ProductSpec | StructuredSpec:
+def apply_canonical_task_ids(spec: ProductSpec) -> ProductSpec:
     mapping = resolve_task_ids(spec)
     for task in spec.iter_tasks():
         old = task.task_id

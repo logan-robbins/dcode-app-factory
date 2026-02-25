@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
-import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,14 +11,16 @@ from typing import Any
 from langchain_core.tools import tool
 
 from .models import (
+    BoundaryLevel,
     CompatibilityExpectation,
     InterfaceChangeException,
     InterfaceChangeType,
+    ProductSpec,
     RaisedBy,
     ReuseSearchReport,
     Urgency,
 )
-from .registry import AppendOnlyCodeIndex
+from .registry import CodeIndex
 from .settings import RuntimeSettings
 from .state_store import project_scoped_root
 from .utils import emit_structured_spec, validate_spec
@@ -44,28 +45,18 @@ def _project_root_from_env() -> Path:
 
 @tool("web_search")
 def web_search(query: str) -> str:
-    """Search the web using Tavily or SerpAPI and return compact JSON results."""
+    """Search the web using Tavily and return compact JSON results."""
     tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
-    if tavily_key:
-        payload = {
-            "api_key": tavily_key,
-            "query": query,
-            "max_results": 5,
-            "include_answer": True,
-        }
-        data = _http_post_json("https://api.tavily.com/search", payload, headers={})
-        return json.dumps(data, indent=2)
-
-    serp_key = os.getenv("SERPAPI_API_KEY", "").strip()
-    if serp_key:
-        url = (
-            "https://serpapi.com/search.json?"
-            + urllib.parse.urlencode({"q": query, "api_key": serp_key, "engine": "google"})
-        )
-        with urllib.request.urlopen(url, timeout=30) as response:
-            return response.read().decode("utf-8")
-
-    raise RuntimeError("web_search requires TAVILY_API_KEY or SERPAPI_API_KEY")
+    if not tavily_key:
+        raise RuntimeError("web_search requires TAVILY_API_KEY")
+    payload = {
+        "api_key": tavily_key,
+        "query": query,
+        "max_results": 5,
+        "include_answer": True,
+    }
+    data = _http_post_json("https://api.tavily.com/search", payload, headers={})
+    return json.dumps(data, indent=2)
 
 
 @tool("validate_spec")
@@ -73,9 +64,7 @@ def validate_spec_tool(spec_path: str) -> str:
     """Validate ProductSpec JSON against schema and completeness criteria."""
     path = Path(spec_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
-    from .models import StructuredSpec
-
-    spec = StructuredSpec.model_validate(payload)
+    spec = ProductSpec.model_validate(payload)
     report = validate_spec(spec)
     return report.model_dump_json(indent=2)
 
@@ -83,9 +72,7 @@ def validate_spec_tool(spec_path: str) -> str:
 @tool("emit_structured_spec")
 def emit_structured_spec_tool(spec_json: str, output_path: str) -> str:
     """Persist validated ProductSpec JSON artifact."""
-    from .models import StructuredSpec
-
-    spec = StructuredSpec.model_validate_json(spec_json)
+    spec = ProductSpec.model_validate_json(spec_json)
     path = Path(output_path)
     emit_structured_spec(spec, path)
     return str(path)
@@ -96,13 +83,14 @@ def search_code_index(
     query: str,
     top_k: int = 10,
     include_inactive: bool = False,
+    level: str | None = None,
     tags: list[str] | None = None,
     input_types: list[str] | None = None,
     output_types: list[str] | None = None,
 ) -> str:
-    """Search append-only code index and return ranked JSON results."""
+    """Search code index and return ranked JSON results."""
     settings = RuntimeSettings.from_env()
-    index = AppendOnlyCodeIndex(
+    index = CodeIndex(
         _project_root_from_env() / "code_index",
         embedding_model=settings.embedding_model,
     )
@@ -110,6 +98,7 @@ def search_code_index(
         query,
         top_k=top_k,
         include_inactive=include_inactive,
+        level=BoundaryLevel(level) if level else None,
         tags=tags,
         input_types=input_types,
         output_types=output_types,

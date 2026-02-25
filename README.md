@@ -4,12 +4,12 @@ LangGraph + deepagents implementation of the AI software product factory defined
 
 - Product Loop with structured `ProductSpec` validation and emission
 - Project Loop `StateGraph` dispatch cycle (`init_state_machine -> dispatch -> engineering -> update_state_machine`)
-- Engineering Loop `StateGraph` with `micro_plan` + per-module iteration and nested debate subgraph
+- Engineering Loop `StateGraph` with level-aware `micro_plan` (L2 system, L3 service, L4 component, selective L5 class contracts) + per-module iteration and nested debate subgraph
 - Debate subgraph routing (`propose -> challenge -> route -> revise/adjudicate -> ship/halt`) using `Command(goto=...)` and parent propagation support
-- Release Loop integration gates (`dependency`, `fingerprint`, `deprecation`, `code_index`)
-- Filesystem state-store with universal artifact envelopes, context-pack persistence, exceptions, escalations, debates, modules, and release manifests
+- Release Loop integration gates (`dependency`, `fingerprint`, `deprecation`, `code_index`, `contract_completeness`, `compatibility`, `ownership`, `context_pack_compliance`)
+- Filesystem state-store with universal artifact envelopes, levelled contract persistence, context-pack persistence, exceptions, escalations, debates, modules, and release manifests
 - Chroma-backed append-only Code Index with OpenAI semantic embeddings by default, metadata filters, lifecycle transitions, and model-change reindex support
-- Backend enforcement wrappers for immutability, opaque implementation access control, and context-pack permissions
+- Backend enforcement wrappers for immutability, opaque implementation access control, and level-aware context-pack permissions
 - SQLite checkpointing for outer/project graph execution
 
 ## System Overview
@@ -96,11 +96,15 @@ LangGraph + deepagents implementation of the AI software product factory defined
  |  | 5. RELEASE LOOP                              | |
  |  |    collect shipped modules                   | |
  |  |    expand transitive dependency closure      | |
- |  |    run 4 gates:                              | |
+|  |    run 8 gates:                              | |
  |  |      - dependency completeness               | |
  |  |      - fingerprint verification              | |
  |  |      - deprecation check                     | |
- |  |      - code index status check               | |
+|  |      - code index status check               | |
+|  |      - contract completeness                 | |
+|  |      - compatibility                         | |
+|  |      - ownership                             | |
+|  |      - context-pack compliance               | |
  |  |    emit release manifest (PASS / FAIL)       | |
  |  +----------------------------------------------+ |
  +===================================================+
@@ -114,7 +118,10 @@ LangGraph + deepagents implementation of the AI software product factory defined
  |  project/  state_machine |   |  search for reuse     |
  |  tasks/    per-task .md  |   |  CURRENT -> DEPRECATED|
  |  artifacts/ envelopes    |   |  auto-reindex on      |
- |  modules/  sealed+immut  |   |  embedding model swap |
+|  modules/  sealed+immut  |   |  embedding model swap |
+|  system_contracts/       |
+|  service_contracts/      |
+|  class_contracts/        |
  |  debates/  prop/chal/adj |   +-----------------------+
  |  context_packs/          |
  |  escalations/            |   +-----------------------+
@@ -127,8 +134,10 @@ LangGraph + deepagents implementation of the AI software product factory defined
  KEY CONCEPTS
  ============
  ProductSpec     Pillars > Epics > Stories > Tasks (hierarchical spec)
- MicroPlan       Task decomposed into atomic modules with topo ordering
+ MicroPlan       Task decomposed into level-aware modules with topo ordering
+ Boundary Levels L1 functional -> L2 system -> L3 service -> L4 component -> selective L5 class
  Contract        Formal I/O interface per module (SHA-256 fingerprinted)
+ ClassContract   Shared/orchestrating class boundary consumed as black box
  Debate          Adversarial propose/challenge/adjudicate quality gate
  ArtifactEnvelope Universal wrapper: DRAFT -> SHIPPED -> DEPRECATED
  ContextPack     Per-role access control (FULL / CONTRACT_ONLY / etc.)
@@ -272,12 +281,16 @@ flowchart TB
             direction TB
             REL_INIT["init<br/>collect all shipped module_refs<br/>expand transitive dependency closure"]
 
-            subgraph GATES["gate_check — 4 Release Gates"]
+            subgraph GATES["gate_check — 8 Release Gates"]
                 direction TB
                 G1["dependency_check<br/>all deps present in release set"]
                 G2["fingerprint_check<br/>interface fingerprints verifiable"]
                 G3["deprecation_check<br/>no DEPRECATED or SUPERSEDED modules"]
                 G4["code_index_check<br/>all modules CURRENT"]
+                G5["contract_completeness_check<br/>L2/L3/L4/L5 contract artifacts present"]
+                G6["compatibility_check<br/>no BREAKING_MAJOR entries in release set"]
+                G7["ownership_check<br/>all modules have owners"]
+                G8["context_pack_compliance_check<br/>contract-only permissions are level-scoped"]
             end
 
             REL_FIN["finalize<br/>write release manifest JSON<br/>PASS / FAIL"]
@@ -295,7 +308,10 @@ flowchart TB
             SS_PROJ["project/<br/>state_machine.json"]
             SS_TASK["tasks/<br/>{task_id}.md"]
             SS_ART["artifacts/<br/>envelope.json · payload"]
+            SS_SYS["system_contracts/<br/>contract.json"]
+            SS_SVC["service_contracts/<br/>contract.json"]
             SS_MOD["modules/<br/>contract · examples · ship<br/>.sealed · .immutable"]
+            SS_CLS["class_contracts/<br/>contract.json"]
             SS_DEB["debates/<br/>proposal · challenge · adjudication"]
             SS_CP["context_packs/<br/>{cp_id}.json"]
             SS_ESC["escalations/<br/>{esc_id}.json"]
@@ -324,7 +340,7 @@ flowchart TB
             LLM_CHAT["ChatOpenAI<br/>(frontier · efficient · economy)"]
             LLM_STRUCT["StructuredOutputAdapter<br/>function_calling + strict=true"]
             LLM_EMBED["Embeddings<br/>text-embedding-3-large"]
-            LLM_MODEL["RuntimeModelSelection<br/>tier routing + role overrides"]
+            LLM_MODEL["RuntimeModelSelection<br/>tier routing"]
         end
 
         CKPT["SQLite Checkpointing<br/>langgraph.sqlite"]
@@ -359,7 +375,7 @@ flowchart TB
 
 1. Python 3.12+
 2. `uv`
-3. `OPENAI_API_KEY` set (or present in `.env`)
+3. `OPENAI_API_KEY` set in the environment
 
 ## Setup
 
@@ -424,19 +440,19 @@ Runtime settings:
 - `FACTORY_CONTEXT_BUDGET_CAP` (default: `16000`)
 - `FACTORY_RECURSION_LIMIT` (default: `1000`)
 - `FACTORY_CHECKPOINT_DB` (default: `state_store/checkpoints/langgraph.sqlite`)
+- `FACTORY_CLASS_CONTRACT_POLICY` (default: `selective_shared`; options: `selective_shared`, `universal_public`, `service_only`)
 
 Model routing:
 
 - `FACTORY_MODEL_FRONTIER` (default: `gpt-4o`)
 - `FACTORY_MODEL_EFFICIENT` (default: `gpt-4o-mini`)
 - `FACTORY_MODEL_ECONOMY` (default: `gpt-4o-mini`)
-- `FACTORY_EMBEDDING_MODEL` (default: `text-embedding-3-large`; test-only deterministic override: `deterministic-hash-384`)
+- `FACTORY_EMBEDDING_MODEL` (default: `text-embedding-3-large`; deterministic test model value: `deterministic-hash-384`)
 - `FACTORY_DEBATE_USE_LLM` (default: `true`; real model-backed debate path)
 
 Search tooling:
 
-- `TAVILY_API_KEY` (optional; enables `web_search` tool)
-- `SERPAPI_API_KEY` (optional; fallback for `web_search`)
+- `TAVILY_API_KEY` (required for `web_search` tool)
 
 ## State Store Layout
 
@@ -446,7 +462,10 @@ Primary directories under `state_store/projects/{project_id}/`:
 - `project/` (`state_machine.json`)
 - `tasks/` (`{task_id}.md`)
 - `artifacts/{artifact_id}/` (`envelope.json`, payload files)
+- `system_contracts/{system_id}/{version}/contract.json`
+- `service_contracts/{service_id}/{version}/contract.json`
 - `modules/{module_id}/{version}/` (`contract.json`, `examples.md`, `ship.json`, sealed markers)
+- `class_contracts/{class_id}/{version}/contract.json`
 - `debates/{artifact_id}/` (`proposal.json`, `challenge.json`, `adjudication.json`)
 - `context_packs/{cp_id}.json`
 - `exceptions/{exception_id}.json`
@@ -485,7 +504,9 @@ ls -1 state_store/projects/PROJECT-001/release
 
 - Product Loop uses deepagents (`create_deep_agent`) with integrated tools.
 - Product + Engineering flows enforce reuse-first policy and execute `search_code_index` before create-new decisions.
+- Engineering emits level-aware contracts (L2/L3/L4 and selective L5) before module shipping and enforces black-box consumption via context-pack scopes.
 - Engineering debate runs model-backed by default with structured output via `function_calling` + `strict=true` to avoid current `json_schema` serializer warnings in the LangChain/OpenAI response path; set `FACTORY_DEBATE_USE_LLM=false` only for deterministic local testing.
 - Engineering contract dependencies are resolved from actual shipped module refs (not hardcoded `@1.0.0`), and release manifests include transitive dependency closure before running release gates.
+- Release gates include dependency, fingerprint, deprecation, code-index, contract-completeness, compatibility, ownership, and context-pack compliance checks.
 - Opaque access-denied errors use the required fixed format defined in SPEC §12.5.
 - Code Index status transitions are one-way (`CURRENT -> DEPRECATED|SUPERSEDED`).
