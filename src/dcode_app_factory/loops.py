@@ -68,7 +68,7 @@ from .utils import (
     apply_canonical_task_ids,
     build_context_pack,
     emit_structured_spec,
-    parse_raw_spec_to_product_spec,
+    parse_raw_request_to_product_spec,
     render_spec_markdown,
     resolve_task_ids,
     slugify_name,
@@ -83,10 +83,14 @@ class ProductLoop:
         self,
         raw_spec: str,
         *,
+        request_kind: str = "AUTO",
+        target_codebase_root: str | None = None,
         state_store_root: str | Path | None = None,
         settings: RuntimeSettings | None = None,
     ) -> None:
         self.raw_spec = raw_spec
+        self.request_kind = request_kind
+        self.target_codebase_root = target_codebase_root
         self.settings = settings if settings is not None else RuntimeSettings.from_env()
         root = Path(state_store_root) if state_store_root is not None else Path(self.settings.state_store_root)
         self.state_store = FactoryStateStore(root, project_id=self.settings.project_id)
@@ -99,12 +103,13 @@ class ProductLoop:
             tools=[web_search, validate_spec_tool, search_code_index, emit_structured_spec_tool],
             backend=backend,
             system_prompt=(
-                "You are the Product Loop quality gate for a production software factory. "
-                "Policy: contract-first, reuse-first, and no speculative output. "
+                "You are the Product Loop quality gate for a production software factory and must behave like a "
+                "technical product owner plus software architect. "
+                "Policy: contract-first, reuse-first, separation-of-concerns, and no speculative output. "
                 "You must call `validate_spec` for schema/completeness checks, then call "
                 "`search_code_index` for each major task objective before recommending any CREATE_NEW path. "
                 "If no reuse is viable, explicitly state the failed match reason. "
-                "Return concise warnings and release readiness only."
+                "Return concise warnings, architecture risks, and release readiness only."
             ),
             name="product-loop-agent",
         )
@@ -117,6 +122,8 @@ class ProductLoop:
                         "content": (
                             "Validate this ProductSpec JSON path, run reuse-first checks against code index, "
                             "and summarize warnings/readiness in <=12 bullets. "
+                            f"Request kind: {self.request_kind}. "
+                            f"Target codebase root: {self.target_codebase_root or 'current workspace'}. "
                             f"Path: {spec_json_path}"
                         ),
                     }
@@ -126,7 +133,11 @@ class ProductLoop:
         )
 
     def run(self) -> ProductSpec:
-        spec = parse_raw_spec_to_product_spec(self.raw_spec)
+        spec = parse_raw_request_to_product_spec(
+            self.raw_spec,
+            request_kind=self.request_kind,
+            target_codebase_root=self.target_codebase_root,
+        )
         apply_canonical_task_ids(spec)
 
         # Enforce configurable section fan-out cap.
@@ -1593,11 +1604,15 @@ class FactoryOrchestrator:
         self,
         *,
         raw_spec: str,
+        request_kind: str = "AUTO",
+        target_codebase_root: str | None = None,
         settings: RuntimeSettings | None = None,
         state_store_root: str | Path | None = None,
     ) -> None:
         self.settings = settings if settings is not None else RuntimeSettings.from_env()
         self.raw_spec = raw_spec
+        self.request_kind = request_kind
+        self.target_codebase_root = target_codebase_root
         root = Path(state_store_root) if state_store_root is not None else Path(self.settings.state_store_root)
         self.state_store = FactoryStateStore(root, project_id=self.settings.project_id)
         self.code_index = CodeIndex(
@@ -1641,7 +1656,13 @@ class FactoryOrchestrator:
         return graph
 
     def _product_node(self, state: OuterGraphState) -> dict[str, Any]:
-        loop = ProductLoop(state["raw_spec"], state_store_root=self.state_store.base_root, settings=self.settings)
+        loop = ProductLoop(
+            state["raw_spec"],
+            request_kind=self.request_kind,
+            target_codebase_root=self.target_codebase_root,
+            state_store_root=self.state_store.base_root,
+            settings=self.settings,
+        )
         spec = loop.run()
         return {"spec": spec.model_dump(mode="json")}
 

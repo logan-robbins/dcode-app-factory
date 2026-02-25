@@ -28,6 +28,9 @@ TESTABLE_VERB_RE = re.compile(
     r"\b(returns|displays|raises|writes|emits|rejects|validates|produces|creates|records|updates)\b",
     re.IGNORECASE,
 )
+REQUEST_KIND_VALUES = frozenset({"AUTO", "FULL_APP", "FEATURE", "BUGFIX", "REFACTOR", "TASK"})
+_BULLET_RE = re.compile(r"^(?:[-*+]|[0-9]+[.)])\s+(.+)$")
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?]\s+")
 
 
 def get_agent_config_dir(stage: str) -> Path:
@@ -305,20 +308,81 @@ def render_spec_markdown(spec: ProductSpec) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def _extract_sections(raw_spec: str) -> list[str]:
+def normalize_request_kind(request_kind: str) -> str:
+    normalized = request_kind.strip().upper()
+    if normalized not in REQUEST_KIND_VALUES:
+        choices = ", ".join(sorted(REQUEST_KIND_VALUES))
+        raise ValueError(f"request_kind must be one of: {choices}; got {request_kind!r}")
+    return normalized
+
+
+def _extract_sections(raw_request: str) -> list[str]:
     sections: list[str] = []
-    for line in raw_spec.splitlines():
+    for line in raw_request.splitlines():
         value = line.strip()
         if value.startswith("##"):
-            sections.append(value.lstrip("# "))
+            section = value.lstrip("# ").strip()
+            if section:
+                sections.append(section)
     return sections
 
 
-def parse_raw_spec_to_product_spec(raw_spec: str, *, spec_id: str = "SPEC-001") -> ProductSpec:
-    sections = _extract_sections(raw_spec)
-    if not sections:
-        sections = ["Factory Core", "Project Orchestration", "Engineering Debate"]
+def _extract_plain_request_sections(raw_request: str) -> list[str]:
+    bullets: list[str] = []
+    prose_lines: list[str] = []
+    for line in raw_request.splitlines():
+        value = line.strip()
+        if not value:
+            continue
+        if value.startswith("#"):
+            continue
+        bullet_match = _BULLET_RE.match(value)
+        if bullet_match:
+            bullets.append(bullet_match.group(1).strip())
+            continue
+        prose_lines.append(value)
 
+    if bullets:
+        return [entry for entry in bullets if entry][:6]
+
+    prose = " ".join(prose_lines).strip()
+    if not prose:
+        return []
+    sentences = [segment.strip(" -") for segment in _SENTENCE_SPLIT_RE.split(prose) if segment.strip()]
+    if len(sentences) >= 2:
+        return sentences[:6]
+    return [prose[:160]]
+
+
+def _extract_title(raw_request: str) -> str | None:
+    for line in raw_request.splitlines():
+        value = line.strip()
+        if value.startswith("# "):
+            title = value[2:].strip()
+            if title:
+                return title
+    return None
+
+
+def _summarize_request(raw_request: str, sections: list[str]) -> str:
+    title = _extract_title(raw_request)
+    if title:
+        return title[:96]
+    if sections:
+        joined = "; ".join(sections[:3])
+        return joined[:96]
+    compact = " ".join(raw_request.split())
+    return compact[:96] if compact else "requested change"
+
+
+def _infer_request_kind(raw_request: str, sections: list[str]) -> str:
+    content = raw_request.lower()
+    if "# product" in content or len(sections) >= 2:
+        return "FULL_APP"
+    return "TASK"
+
+
+def _full_app_tasks(sections: list[str]) -> list[Task]:
     tasks: list[Task] = []
     for idx, section in enumerate(sections, start=1):
         task_id = f"TSK-{idx:03d}"
@@ -329,6 +393,7 @@ def parse_raw_spec_to_product_spec(raw_spec: str, *, spec_id: str = "SPEC-001") 
                 description=f"Implement the capability described in '{section}' with explicit contracts and test evidence.",
                 subtasks=[
                     f"Define explicit input/output/error contract boundaries for {section}",
+                    f"Audit current implementation surfaces and reuse candidates for {section}",
                     f"Implement deterministic core behavior for {section}",
                     f"Integrate dependency adapters and side-effect handling for {section}",
                     f"Verify acceptance criteria and ship evidence for {section}",
@@ -348,35 +413,179 @@ def parse_raw_spec_to_product_spec(raw_spec: str, *, spec_id: str = "SPEC-001") 
                 depends_on=[f"TSK-{idx - 1:03d}"] if idx > 1 else [],
             )
         )
+    return tasks
+
+
+def _incremental_tasks(*, request_summary: str, request_sections: list[str], codebase_hint: str | None) -> list[Task]:
+    scope = "; ".join(request_sections[:5]) if request_sections else request_summary
+    codebase_scope = (
+        f"Target codebase root: {codebase_hint}."
+        if codebase_hint
+        else "Target codebase root: current workspace checkout."
+    )
+    return [
+        Task(
+            task_id="TSK-001",
+            name=f"Analyze architecture impact for {request_summary}",
+            description=(
+                f"Perform product-owner and architect analysis for '{scope}'. "
+                f"Document impacted modules, invariants, dependencies, and delivery risks. {codebase_scope}"
+            ),
+            subtasks=[
+                "Map impacted components, services, and data boundaries in the existing codebase",
+                "Identify reusable modules and mark create-new boundaries with rationale",
+                "Enumerate migration, rollout, and failure-mode risks with mitigation notes",
+            ],
+            acceptance_criteria=[
+                "produces a concrete impact map tied to named code surfaces",
+                "records reuse-first decisions and explicit no-reuse reasons",
+                "raises blocking risks with clear decision paths",
+            ],
+            io_contract_sketch=IOContractSketch(
+                inputs="Feature request context, current architecture constraints, and repository topology.",
+                outputs="Approved architecture impact and reuse decision summary.",
+                error_surfaces="Ambiguous requirements, missing constraints, and incompatible existing contracts.",
+                effects="Writes architecture and risk decisions into tracked task artifacts.",
+                modes="sync with deterministic analysis and fail-fast on missing prerequisites.",
+            ),
+            depends_on=[],
+        ),
+        Task(
+            task_id="TSK-002",
+            name=f"Define contract-first delivery plan for {request_summary}",
+            description=(
+                f"Define system, service, and component boundaries for '{scope}' with explicit contract surfaces "
+                "before implementation."
+            ),
+            subtasks=[
+                "Define contract boundaries across L2/L3/L4 interfaces for the requested change",
+                "Specify dependency and compatibility expectations for each boundary",
+                "Generate acceptance criteria aligned to verifiable runtime behavior",
+            ],
+            acceptance_criteria=[
+                "produces explicit I/O and error contracts for each planned boundary",
+                "validates dependency ordering and compatibility expectations",
+                "records testable acceptance criteria for delivery",
+            ],
+            io_contract_sketch=IOContractSketch(
+                inputs="Impact analysis outputs and reusable contract references.",
+                outputs="Contract-first implementation plan with ordered module boundaries.",
+                error_surfaces="Contract ambiguities, dependency cycles, and unresolved compatibility gaps.",
+                effects="Writes contract artifacts and context packs for engineering execution.",
+                modes="sync with deterministic dependency ordering and strict validation.",
+            ),
+            depends_on=["TSK-001"],
+        ),
+        Task(
+            task_id="TSK-003",
+            name=f"Implement and verify {request_summary}",
+            description=(
+                f"Implement '{scope}' against approved boundaries, run verification, and produce release-quality evidence."
+            ),
+            subtasks=[
+                "Implement module changes using approved reusable artifacts and defined contracts",
+                "Execute verification checks and capture ship evidence",
+                "Confirm release readiness and compatibility for downstream consumers",
+            ],
+            acceptance_criteria=[
+                "creates implementation artifacts that satisfy declared contracts",
+                "produces verification evidence demonstrating acceptance coverage",
+                "updates release metadata and compatibility outcomes",
+            ],
+            io_contract_sketch=IOContractSketch(
+                inputs="Approved contract plan, context packs, and existing dependency artifacts.",
+                outputs="Shippable module artifacts with verification evidence.",
+                error_surfaces="Implementation regressions, failed verification checks, and dependency incompatibilities.",
+                effects="Writes shipped artifacts, debate outputs, and release gate evidence.",
+                modes="sync with deterministic retries bounded by adjudication policy.",
+            ),
+            depends_on=["TSK-002"],
+        ),
+    ]
+
+
+def parse_raw_request_to_product_spec(
+    raw_request: str,
+    *,
+    spec_id: str = "SPEC-001",
+    request_kind: str = "AUTO",
+    target_codebase_root: str | None = None,
+) -> ProductSpec:
+    if not raw_request.strip():
+        raise ValueError("raw_request must be non-empty")
+
+    sections = _extract_sections(raw_request)
+    if not sections:
+        sections = _extract_plain_request_sections(raw_request)
+    if not sections:
+        sections = ["Factory Core", "Project Orchestration", "Engineering Debate"]
+
+    normalized_kind = normalize_request_kind(request_kind)
+    if normalized_kind == "AUTO":
+        normalized_kind = _infer_request_kind(raw_request, sections)
+
+    request_summary = _summarize_request(raw_request, sections)
+
+    if normalized_kind == "FULL_APP":
+        tasks = _full_app_tasks(sections)
+        pillar_name = "Reliable Factory Core"
+        pillar_description = "Deterministic and auditable software factory execution."
+        pillar_rationale = "Reliability and traceability are required for autonomous delivery."
+        epic_name = "End-to-end Orchestration"
+        epic_description = "Implements product, project, engineering, and release flows."
+        story_name = "Deliver deterministic execution"
+        story_description = "Ensure execution remains deterministic and auditable."
+        behavior = "Operators can run and inspect a complete auditable pipeline."
+        title = _extract_title(raw_request) or "AI Software Product Factory"
+        description = "Contract-first factory specification generated from markdown source."
+    else:
+        tasks = _incremental_tasks(
+            request_summary=request_summary,
+            request_sections=sections,
+            codebase_hint=target_codebase_root,
+        )
+        pillar_name = "Incremental Change Delivery"
+        pillar_description = "Contract-first and reuse-first delivery for existing systems."
+        pillar_rationale = "Feature velocity must preserve architecture integrity and compatibility."
+        epic_name = "Task-Oriented Delivery Loop"
+        epic_description = "Runs product, project, engineering, and release loops for any scoped change request."
+        story_name = "Deliver change safely in existing codebases"
+        story_description = "Turn a task request into analyzed, contract-defined, and verified shipped work."
+        behavior = "Operators can submit a single task request and receive a release-gated result."
+        title = _extract_title(raw_request) or f"{normalized_kind.title()} Delivery Request"
+        description = (
+            f"Contract-first work plan generated from a {normalized_kind.lower()} request with "
+            "reuse-first and separation-of-concerns constraints."
+        )
 
     now = datetime.now(UTC)
     spec = ProductSpec(
         spec_id=spec_id,
         spec_version="1.0.0",
-        title="AI Software Product Factory",
-        description="Contract-first factory specification generated from markdown source.",
+        title=title,
+        description=description,
         created_at=now,
         updated_at=now,
         pillars=[
             Pillar(
                 pillar_id="PIL-001",
-                name="Reliable Factory Core",
-                description="Deterministic and auditable software factory execution.",
-                rationale="Reliability and traceability are required for autonomous delivery.",
+                name=pillar_name,
+                description=pillar_description,
+                rationale=pillar_rationale,
                 epics=[
                     {
                         "epic_id": "EPC-001",
-                        "name": "End-to-end Orchestration",
-                        "description": "Implements product, project, engineering, and release flows.",
+                        "name": epic_name,
+                        "description": epic_description,
                         "success_criteria": [
                             "dispatches tasks deterministically",
                         ],
                         "stories": [
                             Story(
                                 story_id="STR-001",
-                                name="Deliver deterministic execution",
-                                description="Ensure execution remains deterministic and auditable.",
-                                user_facing_behavior="Operators can run and inspect a complete auditable pipeline.",
+                                name=story_name,
+                                description=story_description,
+                                user_facing_behavior=behavior,
                                 tasks=tasks,
                             )
                         ],
@@ -389,8 +598,12 @@ def parse_raw_spec_to_product_spec(raw_spec: str, *, spec_id: str = "SPEC-001") 
     report = validate_spec(spec)
     if report.errors:
         deficiency = "; ".join(f"{entry.path}:{entry.message}" for entry in report.errors)
-        raise ValueError(f"Unable to construct valid ProductSpec from raw spec: {deficiency}")
+        raise ValueError(f"Unable to construct valid ProductSpec from raw request: {deficiency}")
     return spec
+
+
+def parse_raw_spec_to_product_spec(raw_spec: str, *, spec_id: str = "SPEC-001") -> ProductSpec:
+    return parse_raw_request_to_product_spec(raw_spec, spec_id=spec_id, request_kind="FULL_APP")
 
 
 def build_context_pack(

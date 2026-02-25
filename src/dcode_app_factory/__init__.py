@@ -40,7 +40,14 @@ from .models import (
     ValidationReport,
 )
 from .registry import CodeIndex
-from .utils import get_agent_config_dir, slugify_name, to_canonical_json, validate_spec, validate_task_dependency_dag
+from .utils import (
+    get_agent_config_dir,
+    parse_raw_request_to_product_spec,
+    slugify_name,
+    to_canonical_json,
+    validate_spec,
+    validate_task_dependency_dag,
+)
 
 
 def get_version() -> str:
@@ -96,6 +103,7 @@ __all__ = [
     "ValidationReport",
     "DEFAULT_MODELS_BY_TIER",
     "get_agent_config_dir",
+    "parse_raw_request_to_product_spec",
     "resolve_agent_models",
     "slugify_name",
     "to_canonical_json",

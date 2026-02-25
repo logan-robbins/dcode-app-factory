@@ -12,12 +12,28 @@ from dcode_app_factory.settings import RuntimeSettings
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SPEC_TEXT = "# Product\n## Factory architecture\n## Project loop\n## Engineering debate\n"
+DEFAULT_REQUEST_TEXT = "# Product\n## Factory architecture\n## Project loop\n## Engineering debate\n"
+REQUEST_KIND_CHOICES = ["AUTO", "FULL_APP", "FEATURE", "BUGFIX", "REFACTOR", "TASK"]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the dcode_app_factory outer graph")
-    parser.add_argument("--spec-file", type=Path, default=None, help="Optional path to markdown spec input")
+    parser.add_argument("--request-file", type=Path, default=None, help="Optional path to markdown work request input")
+    parser.add_argument("--request-text", default=None, help="Inline work request text (mutually exclusive with request/spec file)")
+    parser.add_argument(
+        "--request-kind",
+        type=lambda value: value.upper(),
+        default="AUTO",
+        choices=REQUEST_KIND_CHOICES,
+        help="Request intent: full app build or incremental work item routing",
+    )
+    parser.add_argument(
+        "--target-codebase-root",
+        type=Path,
+        default=None,
+        help="Optional path to target repository root for existing-codebase feature work",
+    )
+    parser.add_argument("--spec-file", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--approval-action",
         default="APPROVE",
@@ -34,18 +50,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_raw_spec(spec_file: Path | None) -> str:
-    settings = RuntimeSettings.from_env()
-    if spec_file is not None:
-        if not spec_file.is_file():
-            raise FileNotFoundError(f"Requested spec file does not exist: {spec_file}")
-        return spec_file.read_text(encoding="utf-8")
+def load_raw_request(*, request_file: Path | None, request_text: str | None, spec_file: Path | None) -> str:
+    if request_text is not None and (request_file is not None or spec_file is not None):
+        raise ValueError("request_text cannot be combined with request/spec file input")
+    if request_file is not None and spec_file is not None:
+        raise ValueError("request_file and spec_file are mutually exclusive")
 
-    default_path = settings.default_spec_file(REPO_ROOT)
+    settings = RuntimeSettings.from_env()
+    if request_text is not None:
+        trimmed = request_text.strip()
+        if not trimmed:
+            raise ValueError("request_text must be non-empty")
+        return trimmed
+
+    source_path = request_file if request_file is not None else spec_file
+    if source_path is not None:
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Requested input file does not exist: {source_path}")
+        return source_path.read_text(encoding="utf-8")
+
+    default_path = settings.default_request_file(REPO_ROOT)
     if default_path.is_file():
         return default_path.read_text(encoding="utf-8")
 
-    return DEFAULT_SPEC_TEXT
+    return DEFAULT_REQUEST_TEXT
 
 
 def main() -> int:
@@ -56,12 +84,26 @@ def main() -> int:
     )
 
     try:
-        raw_spec = load_raw_spec(args.spec_file)
-    except OSError as exc:
-        logging.error("Unable to load spec text: %s", exc)
+        raw_request = load_raw_request(
+            request_file=args.request_file,
+            request_text=args.request_text,
+            spec_file=args.spec_file,
+        )
+        target_codebase_root = args.target_codebase_root
+        if target_codebase_root is not None:
+            if not target_codebase_root.exists():
+                raise FileNotFoundError(f"Target codebase root does not exist: {target_codebase_root}")
+            if not target_codebase_root.is_dir():
+                raise ValueError(f"Target codebase root is not a directory: {target_codebase_root}")
+    except (OSError, ValueError) as exc:
+        logging.error("Unable to load request input: %s", exc)
         return 1
 
-    orchestrator = FactoryOrchestrator(raw_spec=raw_spec)
+    orchestrator = FactoryOrchestrator(
+        raw_spec=raw_request,
+        request_kind=args.request_kind,
+        target_codebase_root=str(target_codebase_root.resolve()) if target_codebase_root is not None else None,
+    )
     try:
         result = orchestrator.run(
             approval_action=args.approval_action,

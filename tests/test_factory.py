@@ -71,6 +71,7 @@ from dcode_app_factory.state_store import ArtifactStoreService, FactoryStateStor
 from dcode_app_factory.settings import RuntimeSettings
 from dcode_app_factory.utils import (
     apply_canonical_task_ids,
+    parse_raw_request_to_product_spec,
     parse_raw_spec_to_product_spec,
     resolve_task_ids,
     slugify_name,
@@ -208,6 +209,31 @@ def test_product_parser_and_validation() -> None:
     report = validate_spec(spec)
     assert not report.errors
     validate_task_dependency_dag(spec)
+
+
+def test_request_parser_supports_incremental_feature_mode() -> None:
+    spec = parse_raw_request_to_product_spec(
+        "Add a user profile settings screen with avatar upload and notification toggles.",
+        request_kind="FEATURE",
+        target_codebase_root="/tmp/existing-repo",
+    )
+
+    tasks = spec.iter_tasks()
+    assert spec.pillars[0].name == "Incremental Change Delivery"
+    assert len(tasks) == 3
+    assert [task.task_id for task in tasks] == ["TSK-001", "TSK-002", "TSK-003"]
+    assert tasks[1].depends_on == ["TSK-001"]
+    assert tasks[2].depends_on == ["TSK-002"]
+    assert "Analyze architecture impact" in tasks[0].name
+
+
+def test_request_parser_auto_mode_prefers_full_app_with_markdown_sections() -> None:
+    spec = parse_raw_request_to_product_spec("# Product\n## A\n## B", request_kind="AUTO")
+    tasks = spec.iter_tasks()
+    assert spec.pillars[0].name == "Reliable Factory Core"
+    assert len(tasks) == 2
+    assert tasks[0].name == "Implement A"
+    assert tasks[1].depends_on == ["TSK-001"]
 
 
 def test_canonical_task_ids_are_unique_and_hierarchical() -> None:

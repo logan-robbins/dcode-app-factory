@@ -3,6 +3,7 @@
 LangGraph + deepagents implementation of the AI software product factory defined in `SPEC.md`, including:
 
 - Product Loop with structured `ProductSpec` validation and emission
+- Unified request intake for full app specs and incremental feature/bugfix/refactor/task requests
 - Project Loop `StateGraph` dispatch cycle (`init_state_machine -> dispatch -> engineering -> update_state_machine`)
 - Engineering Loop `StateGraph` with level-aware `micro_plan` (L2 system, L3 service, L4 component, selective L5 class contracts) + per-module iteration and nested debate subgraph
 - Debate subgraph routing (`propose -> challenge -> route -> revise/adjudicate -> ship/halt`) using `Command(goto=...)` and parent propagation support
@@ -15,7 +16,7 @@ LangGraph + deepagents implementation of the AI software product factory defined
 ## System Overview
 
 ```
- RAW MARKDOWN SPEC (SPEC.md or --spec-file)
+ RAW WORK REQUEST (SPEC.md, --request-file, or --request-text)
          |
          v
  +===================================================+
@@ -23,7 +24,7 @@ LangGraph + deepagents implementation of the AI software product factory defined
  |                                                    |
  |  +----------------------------------------------+ |
  |  | 1. PRODUCT LOOP                              | |
- |  |    raw markdown                              | |
+ |  |    raw work request                          | |
  |  |      -> parse into ProductSpec hierarchy     | |
  |  |         (Pillars > Epics > Stories > Tasks)  | |
  |  |      -> assign canonical task IDs            | |
@@ -151,8 +152,8 @@ LangGraph + deepagents implementation of the AI software product factory defined
 ```mermaid
 flowchart TB
     subgraph ENTRY["Entry Point"]
-        RAW_SPEC["Raw Markdown Spec<br/>(SPEC.md or --spec-file)"]
-        CLI["factory_main.py<br/>--spec-file · --approval-action · --log-level"]
+        RAW_SPEC["Raw Work Request<br/>(SPEC.md, --request-file, or --request-text)"]
+        CLI["factory_main.py<br/>--request-file · --request-kind · --target-codebase-root · --approval-action · --log-level"]
     end
 
     RAW_SPEC --> CLI
@@ -163,7 +164,7 @@ flowchart TB
 
         subgraph PL["① Product Loop"]
             direction TB
-            PL_PARSE["parse_raw_spec_to_product_spec()<br/>Markdown → ProductSpec"]
+            PL_PARSE["parse_raw_request_to_product_spec()<br/>Request → ProductSpec"]
             PL_IDS["apply_canonical_task_ids()<br/>T-pillar-epic-story-seq"]
             PL_VAL["validate_spec()<br/>schema · DAG · I/O sketches · criteria"]
             PL_EMIT["render_spec_markdown()<br/>emit_structured_spec()"]
@@ -391,19 +392,29 @@ Default run (uses `SPEC.md` unless overridden):
 uv run python scripts/factory_main.py
 ```
 
-Run with explicit spec and non-interactive approval action:
+Run with explicit request file and non-interactive approval action:
 
 ```bash
 uv run python scripts/factory_main.py \
-  --spec-file /tmp/spec.md \
+  --request-file /tmp/request.md \
   --approval-action APPROVE \
   --log-level INFO
+```
+
+Run an incremental feature request against an existing codebase:
+
+```bash
+uv run python scripts/factory_main.py \
+  --request-text "Add OAuth login to the existing web app with role-based route guards." \
+  --request-kind FEATURE \
+  --target-codebase-root /path/to/existing/repo \
+  --approval-action APPROVE
 ```
 
 Run with a project-scoped delivery repository root:
 
 ```bash
-FACTORY_PROJECT_ID=ACME-TRADER-SITE uv run python scripts/factory_main.py --spec-file /tmp/spec.md
+FACTORY_PROJECT_ID=ACME-TRADER-SITE uv run python scripts/factory_main.py --request-file /tmp/request.md
 ```
 
 ## Official E2E prompt test
@@ -413,8 +424,10 @@ cat > /tmp/stock_trader_prompt_spec.md <<'EOF2'
 # Product
 ## build a website for stock traders that comapares APIs from major providers and ranks them
 EOF2
-uv run python scripts/factory_main.py --spec-file /tmp/stock_trader_prompt_spec.md --log-level INFO
+uv run python scripts/factory_main.py --request-file /tmp/stock_trader_prompt_spec.md --log-level INFO
 ```
+
+`--spec-file` is still accepted as a backwards-compatible alias for `--request-file`.
 
 Expected output includes:
 
@@ -432,7 +445,8 @@ uv run pytest -q
 
 Runtime settings:
 
-- `FACTORY_DEFAULT_SPEC_PATH` (default: `SPEC.md`)
+- `FACTORY_DEFAULT_REQUEST_PATH` (default: `SPEC.md`; preferred)
+- `FACTORY_DEFAULT_SPEC_PATH` (legacy alias for `FACTORY_DEFAULT_REQUEST_PATH`)
 - `FACTORY_STATE_STORE_ROOT` (default: `state_store`)
 - `FACTORY_PROJECT_ID` (default: `PROJECT-001`; used as project-scoped repository folder name)
 - `FACTORY_MAX_PRODUCT_SECTIONS` (default: `8`)
@@ -503,6 +517,7 @@ ls -1 state_store/projects/PROJECT-001/release
 ## Notes
 
 - Product Loop uses deepagents (`create_deep_agent`) with integrated tools.
+- Product Loop evaluates every request as a technical product-owner/architect pass before project dispatch.
 - Product + Engineering flows enforce reuse-first policy and execute `search_code_index` before create-new decisions.
 - Engineering emits level-aware contracts (L2/L3/L4 and selective L5) before module shipping and enforces black-box consumption via context-pack scopes.
 - Engineering debate runs model-backed by default with structured output via `function_calling` + `strict=true` to avoid current `json_schema` serializer warnings in the LangChain/OpenAI response path; set `FACTORY_DEBATE_USE_LLM=false` only for deterministic local testing.
