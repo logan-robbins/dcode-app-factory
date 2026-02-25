@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
@@ -43,20 +43,109 @@ def _project_root_from_env() -> Path:
     return project_scoped_root(Path(settings.state_store_root), settings.project_id)
 
 
+def _coerce_json_object(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list):
+        return {"results": payload}
+    if isinstance(payload, str):
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Bright Data response was not valid JSON") from exc
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list):
+            return {"results": parsed}
+    raise RuntimeError("Bright Data response must be a JSON object or JSON list")
+
+
+def _first_string(entry: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _find_result_candidates(payload: Any) -> list[dict[str, Any]]:
+    queue: list[Any] = [payload]
+    while queue:
+        node = queue.pop(0)
+        if isinstance(node, dict):
+            for key in ("organic", "organic_results", "results"):
+                value = node.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    queue.append(value)
+            continue
+        if isinstance(node, list):
+            dict_items = [item for item in node if isinstance(item, dict)]
+            if dict_items and any(
+                any(field in item for field in ("url", "link", "title", "description", "snippet"))
+                for item in dict_items[:5]
+            ):
+                return dict_items
+            queue.extend(item for item in node if isinstance(item, (dict, list)))
+    return []
+
+
+def _compact_bright_data_results(payload: dict[str, Any], *, max_results: int) -> list[dict[str, str]]:
+    candidates = _find_result_candidates(payload)
+    compact: list[dict[str, str]] = []
+    for entry in candidates:
+        url = _first_string(entry, ("url", "link", "displayed_link"))
+        title = _first_string(entry, ("title", "name", "headline"))
+        snippet = _first_string(entry, ("snippet", "description", "text", "body"))
+        if not any((url, title, snippet)):
+            continue
+        compact.append(
+            {
+                "url": url,
+                "title": title,
+                "snippet": snippet,
+            }
+        )
+        if len(compact) >= max_results:
+            break
+    return compact
+
+
 @tool("web_search")
 def web_search(query: str) -> str:
-    """Search the web using Tavily and return compact JSON results."""
-    tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
-    if not tavily_key:
-        raise RuntimeError("web_search requires TAVILY_API_KEY")
+    """Search the web using Bright Data and return compact JSON results."""
+    brightdata_key = os.getenv("BRIGHTDATA_API_KEY", "").strip()
+    if not brightdata_key:
+        raise RuntimeError("web_search requires BRIGHTDATA_API_KEY")
+    brightdata_zone = os.getenv("BRIGHTDATA_SERP_ZONE", "").strip()
+    if not brightdata_zone:
+        raise RuntimeError("web_search requires BRIGHTDATA_SERP_ZONE")
+    country = os.getenv("BRIGHTDATA_SERP_COUNTRY", "us").strip() or "us"
+    search_url = f"https://www.google.com/search?{urllib.parse.urlencode({'q': query})}"
     payload = {
-        "api_key": tavily_key,
-        "query": query,
-        "max_results": 5,
-        "include_answer": True,
+        "zone": brightdata_zone,
+        "url": search_url,
+        "format": "json",
+        "country": country,
+        "method": "GET",
     }
-    data = _http_post_json("https://api.tavily.com/search", payload, headers={})
-    return json.dumps(data, indent=2)
+    data = _http_post_json(
+        "https://api.brightdata.com/request",
+        payload,
+        headers={"Authorization": f"Bearer {brightdata_key}"},
+    )
+    normalized = _coerce_json_object(data)
+    results = _compact_bright_data_results(normalized, max_results=5)
+    return json.dumps(
+        {
+            "provider": "brightdata",
+            "query": query,
+            "results": results,
+        },
+        indent=2,
+    )
 
 
 @tool("validate_spec")

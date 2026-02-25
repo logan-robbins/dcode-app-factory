@@ -466,7 +466,9 @@ Model routing:
 
 Search tooling:
 
-- `TAVILY_API_KEY` (required for `web_search` tool)
+- `BRIGHTDATA_API_KEY` (required for `web_search` tool)
+- `BRIGHTDATA_SERP_ZONE` (required for `web_search` tool)
+- `BRIGHTDATA_SERP_COUNTRY` (optional; default: `us`)
 
 ## State Store Layout
 
