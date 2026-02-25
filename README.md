@@ -85,7 +85,6 @@ uv run python scripts/factory_main.py \
 |---|---|---|
 | `--request-text` | Inline work request | string |
 | `--request-file` | File-based work request | path |
-| `--spec-file` | Backward-compatible alias for `--request-file` | path |
 | `--request-kind` | Request routing intent | `AUTO`, `FULL_APP`, `FEATURE`, `BUGFIX`, `REFACTOR`, `TASK` |
 | `--target-codebase-root` | Existing repo root for incremental work | path |
 | `--approval-action` | Approval gate action | `APPROVE`, `REJECT`, `AMEND` |
@@ -94,8 +93,7 @@ uv run python scripts/factory_main.py \
 
 Input rules:
 
-- `--request-text` is mutually exclusive with `--request-file` and `--spec-file`.
-- `--request-file` and `--spec-file` are mutually exclusive.
+- `--request-text` is mutually exclusive with `--request-file`.
 - If no request argument is provided, the runtime loads the default request path and fails fast if missing.
 
 ## Request-Kind Routing Guide
@@ -127,7 +125,6 @@ Process exit code:
 Core runtime settings:
 
 - `FACTORY_DEFAULT_REQUEST_PATH`
-- `FACTORY_DEFAULT_SPEC_PATH` (legacy alias)
 - `FACTORY_STATE_STORE_ROOT`
 - `FACTORY_PROJECT_ID`
 - `FACTORY_MAX_PRODUCT_SECTIONS`

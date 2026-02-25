@@ -110,7 +110,8 @@ class DebateGraph:
             (
                 "You are the proposer role for production engineering debate. "
                 f"{self.role_runtime.role_context_line('proposer')} "
-                "Return Proposal JSON only. Acceptance checks must be objective and executable.\n"
+                "Return Proposal JSON only. Acceptance checks must be objective and executable. "
+                "Do not propose mock/stub/fake/placeholder deliverables.\n"
                 f"TaskID={state['task_id']}\n"
                 f"ModuleID={module_id}\n"
                 f"TargetArtifactID={artifact_id}\n"
@@ -131,7 +132,8 @@ class DebateGraph:
             (
                 "You are the challenger role for adversarial contract evaluation. "
                 f"{self.role_runtime.role_context_line('challenger')} "
-                "Return Challenge JSON only and enforce rubric R1..R6.\n"
+                "Return Challenge JSON only and enforce rubric R1..R6. "
+                "Reject any proposal that relies on mock/stub/fake/placeholder behavior.\n"
                 f"Proposal={proposal.model_dump_json()}\n"
                 f"ContractSummary={state.get('contract_summary', {})}\n"
                 f"ContextSummary={state.get('context_summary', '')}\n"
@@ -166,7 +168,7 @@ class DebateGraph:
             (
                 "You are the arbiter role and must decide APPROVE, APPROVE_WITH_AMENDMENTS, or REJECT. "
                 f"{self.role_runtime.role_context_line('arbiter')} "
-                "Return Adjudication JSON only.\n"
+                "Return Adjudication JSON only. Do not approve proposals with mock/stub/fake/placeholder behavior.\n"
                 f"Proposal={proposal.model_dump_json()}\n"
                 f"Challenge={challenge.model_dump_json()}\n"
                 f"ContractSummary={state.get('contract_summary', {})}\n"

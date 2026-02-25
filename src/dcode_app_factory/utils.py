@@ -353,6 +353,7 @@ def _invoke_product_spec_planner(
         "- Use task IDs in TSK-NNN format (e.g., TSK-001) before canonical remapping.\n"
         "- Every task must have >=2 subtasks and >=2 acceptance criteria.\n"
         "- Every task must include non-placeholder io_contract_sketch fields.\n"
+        "- Do not propose mock/stub/fake/placeholder implementation paths.\n"
         "- Task depends_on values must reference existing task IDs and be acyclic.\n"
         "- Make acceptance criteria testable and implementation-oriented.\n"
         "Raw request follows:\n"

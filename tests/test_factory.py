@@ -56,6 +56,7 @@ from dcode_app_factory.models import (
     InterfaceChangeType,
     ContextPack,
     ContextPermission,
+    HumanResolution,
     HumanResolutionAction,
     InterfaceChangeException,
     ReuseDecision,
@@ -1165,10 +1166,9 @@ def test_load_raw_request_fails_when_default_missing(monkeypatch: pytest.MonkeyP
     factory_main = _load_factory_main_module()
     missing_default = tmp_path / "missing_request.md"
     monkeypatch.setenv("FACTORY_DEFAULT_REQUEST_PATH", str(missing_default))
-    monkeypatch.delenv("FACTORY_DEFAULT_SPEC_PATH", raising=False)
 
     with pytest.raises(FileNotFoundError, match="Default request file does not exist"):
-        factory_main.load_raw_request(request_file=None, request_text=None, spec_file=None)
+        factory_main.load_raw_request(request_file=None, request_text=None)
 
 
 def test_normalize_structured_output_accepts_include_raw_shape() -> None:
@@ -1831,3 +1831,169 @@ def test_engineering_loop_resolves_dependency_refs_and_versions_examples_path(tm
     assert "{\"sample\": true}" not in examples
     payload = json.loads(evidence_path.read_text(encoding="utf-8"))
     assert payload["result"] == "PASS"
+
+
+def test_project_loop_dispatcher_null_ready_queue_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    settings = RuntimeSettings(
+        state_store_root=str(tmp_path),
+        project_id="ACME-DISP-NULL",
+        embedding_model="text-embedding-3-large",
+    )
+    spec = ProductLoop("# Product\n## A", state_store_root=tmp_path, settings=settings).run()
+    loop = ProjectLoop(
+        spec,
+        CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index"),
+        state_store_root=tmp_path,
+        settings=settings,
+        enable_interrupts=False,
+    )
+
+    base_invoke_structured = RoleAgentRuntime.invoke_structured
+
+    def _dispatch_returns_null(self, *, role: str, schema, prompt: str):  # noqa: ANN001,ANN201
+        if schema is DispatchDecision:
+            return schema(selected_task_id=None, rationale="intentionally return no selection")
+        return base_invoke_structured(self, role=role, schema=schema, prompt=prompt)
+
+    monkeypatch.setattr(
+        "dcode_app_factory.agent_runtime.RoleAgentRuntime.invoke_structured",
+        _dispatch_returns_null,
+    )
+
+    loop._init_state_machine_node({"spec": spec.model_dump(mode="json")})
+    with pytest.raises(ValueError, match="dispatcher returned null task while ready_queue is non-empty"):
+        loop._dispatch_node({})
+
+
+def test_project_loop_dispatch_halts_when_unresolved_tasks_have_no_ready_queue(tmp_path: Path) -> None:
+    settings = RuntimeSettings(
+        state_store_root=str(tmp_path),
+        project_id="ACME-DISP-HALT",
+        embedding_model="text-embedding-3-large",
+    )
+    spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
+    loop = ProjectLoop(
+        spec,
+        CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index"),
+        state_store_root=tmp_path,
+        settings=settings,
+        enable_interrupts=False,
+    )
+
+    tasks = spec.iter_tasks()
+    first_task_id = tasks[0].task_id
+    second_task_id = tasks[1].task_id
+    state_machine = build_project_state(spec, project_id=settings.project_id)
+    state_machine.tasks[first_task_id].status = TaskStatus.HALTED
+    state_machine.tasks[second_task_id].status = TaskStatus.BLOCKED
+    loop.state_store.write_project_state(state_machine)
+
+    dispatch = loop._dispatch_node({})
+    assert dispatch["halted"] is True
+    assert dispatch["complete"] is False
+    assert dispatch["current_task_id"] is None
+
+
+def test_project_loop_unblocks_only_when_dependencies_are_shipped(tmp_path: Path) -> None:
+    settings = RuntimeSettings(
+        state_store_root=str(tmp_path),
+        project_id="ACME-BLOCKED-FIXED",
+        embedding_model="text-embedding-3-large",
+    )
+    spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
+    loop = ProjectLoop(
+        spec,
+        CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index"),
+        state_store_root=tmp_path,
+        settings=settings,
+        enable_interrupts=False,
+    )
+
+    tasks = spec.iter_tasks()
+    first_task_id = tasks[0].task_id
+    second_task_id = tasks[1].task_id
+    state_machine = build_project_state(spec, project_id=settings.project_id)
+    state_machine.tasks[first_task_id].status = TaskStatus.HALTED
+    state_machine.tasks[second_task_id].status = TaskStatus.BLOCKED
+
+    loop._clear_blocked_fixed_point(state_machine)
+    assert state_machine.tasks[second_task_id].status == TaskStatus.BLOCKED
+
+    state_machine.tasks[first_task_id].status = TaskStatus.SHIPPED
+    loop._clear_blocked_fixed_point(state_machine)
+    assert state_machine.tasks[second_task_id].status == TaskStatus.PENDING
+
+
+def test_project_loop_resolution_requeues_and_clears_halt_metadata(tmp_path: Path) -> None:
+    settings = RuntimeSettings(
+        state_store_root=str(tmp_path),
+        project_id="ACME-RESOLUTION-FIX",
+        embedding_model="text-embedding-3-large",
+    )
+    spec = ProductLoop("# Product\n## A", state_store_root=tmp_path, settings=settings).run()
+    loop = ProjectLoop(
+        spec,
+        CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index"),
+        state_store_root=tmp_path,
+        settings=settings,
+        enable_interrupts=False,
+    )
+
+    task_id = spec.iter_tasks()[0].task_id
+    loop.state_store.write_task_file(task_id, "# Task\n")
+    state_machine = build_project_state(spec, project_id=settings.project_id)
+
+    task_state = state_machine.tasks[task_id]
+    task_state.status = TaskStatus.HALTED
+    task_state.halted_reason = "blocked"
+    task_state.escalation_ref = "ESC-deadbeef"
+
+    loop._process_resolution(
+        state_machine,
+        task_id,
+        HumanResolution(
+            action=HumanResolutionAction.REVISE_PLAN,
+            revised_micro_plan=[
+                {
+                    "module_id": "MM-replan-01",
+                    "description": "Re-sequence module boundaries to satisfy dependency ordering.",
+                }
+            ],
+        ),
+    )
+    assert task_state.status == TaskStatus.PENDING
+    assert task_state.halted_reason is None
+    assert task_state.escalation_ref is None
+
+    task_state.status = TaskStatus.HALTED
+    task_state.halted_reason = "needs amendment"
+    task_state.escalation_ref = "ESC-feedface"
+    loop._process_resolution(
+        state_machine,
+        task_id,
+        HumanResolution(
+            action=HumanResolutionAction.AMEND_SPEC,
+            amended_acceptance_criteria=["validates and rejects malformed requests"],
+            amendment_rationale="tighten acceptance precision",
+        ),
+    )
+    assert task_state.status == TaskStatus.PENDING
+    assert task_state.halted_reason is None
+    assert task_state.escalation_ref is None
+
+    task_state.status = TaskStatus.HALTED
+    task_state.halted_reason = "patch required"
+    task_state.escalation_ref = "ESC-abad1dea"
+    loop._process_resolution(
+        state_machine,
+        task_id,
+        HumanResolution(
+            action=HumanResolutionAction.PROVIDE_FIX,
+            fix_description="Apply deterministic validation guard",
+            fix_artifacts={"/tasks/fix-note.txt": "deterministic guard applied\n"},
+        ),
+    )
+    assert task_state.status == TaskStatus.PENDING
+    assert task_state.halted_reason is None
+    assert task_state.escalation_ref is None
+    assert (loop.state_store.root / "tasks" / "fix-note.txt").is_file()

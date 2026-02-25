@@ -12,7 +12,7 @@ class RuntimeSettings:
     max_product_sections: int = 8
     context_budget_floor_tokens: int = 2_000
     context_budget_cap_tokens: int = 16_000
-    default_spec_path: str = "SPEC.md"
+    default_request_path: str = "SPEC.md"
     state_store_root: str = "state_store"
     project_id: str = "PROJECT-001"
     model_frontier: str = "gpt-4o"
@@ -29,7 +29,7 @@ class RuntimeSettings:
             max_product_sections=_get_env_int("FACTORY_MAX_PRODUCT_SECTIONS", default=8, minimum=1),
             context_budget_floor_tokens=_get_env_int("FACTORY_CONTEXT_BUDGET_FLOOR", default=2_000, minimum=256),
             context_budget_cap_tokens=_get_env_int("FACTORY_CONTEXT_BUDGET_CAP", default=16_000, minimum=512),
-            default_spec_path=os.getenv("FACTORY_DEFAULT_REQUEST_PATH", os.getenv("FACTORY_DEFAULT_SPEC_PATH", "SPEC.md")),
+            default_request_path=os.getenv("FACTORY_DEFAULT_REQUEST_PATH", "SPEC.md"),
             state_store_root=os.getenv("FACTORY_STATE_STORE_ROOT", "state_store"),
             project_id=os.getenv("FACTORY_PROJECT_ID", "PROJECT-001"),
             model_frontier=os.getenv("FACTORY_MODEL_FRONTIER", "gpt-4o"),
@@ -55,7 +55,7 @@ class RuntimeSettings:
             max_product_sections=self.max_product_sections,
             context_budget_floor_tokens=self.context_budget_floor_tokens,
             context_budget_cap_tokens=cap,
-            default_spec_path=self.default_spec_path,
+            default_request_path=self.default_request_path,
             state_store_root=self.state_store_root,
             project_id=self.project_id,
             model_frontier=self.model_frontier,
@@ -68,11 +68,8 @@ class RuntimeSettings:
         )
 
     def default_request_file(self, repo_root: Path) -> Path:
-        path = Path(self.default_spec_path)
+        path = Path(self.default_request_path)
         return path if path.is_absolute() else repo_root / path
-
-    def default_spec_file(self, repo_root: Path) -> Path:
-        return self.default_request_file(repo_root)
 
     def state_store_path(self, repo_root: Path) -> Path:
         path = Path(self.state_store_root)

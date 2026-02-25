@@ -18,7 +18,7 @@ REQUEST_KIND_CHOICES = ["AUTO", "FULL_APP", "FEATURE", "BUGFIX", "REFACTOR", "TA
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the dcode_app_factory outer graph")
     parser.add_argument("--request-file", type=Path, default=None, help="Optional path to markdown work request input")
-    parser.add_argument("--request-text", default=None, help="Inline work request text (mutually exclusive with request/spec file)")
+    parser.add_argument("--request-text", default=None, help="Inline work request text (mutually exclusive with request file)")
     parser.add_argument(
         "--request-kind",
         type=lambda value: value.upper(),
@@ -32,7 +32,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path to target repository root for existing-codebase feature work",
     )
-    parser.add_argument("--spec-file", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--approval-action",
         default="APPROVE",
@@ -49,11 +48,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_raw_request(*, request_file: Path | None, request_text: str | None, spec_file: Path | None) -> str:
-    if request_text is not None and (request_file is not None or spec_file is not None):
-        raise ValueError("request_text cannot be combined with request/spec file input")
-    if request_file is not None and spec_file is not None:
-        raise ValueError("request_file and spec_file are mutually exclusive")
+def load_raw_request(*, request_file: Path | None, request_text: str | None) -> str:
+    if request_text is not None and request_file is not None:
+        raise ValueError("request_text cannot be combined with request_file input")
 
     settings = RuntimeSettings.from_env()
     if request_text is not None:
@@ -62,7 +59,7 @@ def load_raw_request(*, request_file: Path | None, request_text: str | None, spe
             raise ValueError("request_text must be non-empty")
         return trimmed
 
-    source_path = request_file if request_file is not None else spec_file
+    source_path = request_file
     if source_path is not None:
         if not source_path.is_file():
             raise FileNotFoundError(f"Requested input file does not exist: {source_path}")
@@ -85,7 +82,6 @@ def main() -> int:
         raw_request = load_raw_request(
             request_file=args.request_file,
             request_text=args.request_text,
-            spec_file=args.spec_file,
         )
         target_codebase_root = args.target_codebase_root
         if target_codebase_root is not None:

@@ -174,6 +174,7 @@ class ProductLoop:
             system_prompt = (
                 f"You are the Product Loop {role} role for a production software factory. "
                 "Operate with contract-first, reuse-first, and no speculative output. "
+                "Do not recommend mock/stub/fake implementations or placeholder contracts. "
                 "You must return a single JSON object for ProductRoleReport with exact keys only: "
                 "approved, summary, warnings, blocking_issues, recommended_actions. "
                 f"{role_context} "
@@ -1048,6 +1049,7 @@ class EngineeringLoop:
             "- verify_contract must execute the same logic and return keys: module_ref, sample_inputs, outputs.\n"
             "- Do not perform network, filesystem, environment, or subprocess operations.\n"
             "- Do not use eval/exec/compile/open/input/__import__.\n"
+            "- Do not use mock/stub/fake/placeholder behavior or synthetic fallback paths.\n"
             "- Keep implementation self-contained and production-quality with clear error messages.\n"
             "- sample_inputs must include every required input key with non-empty string values.\n"
             f"Context={json.dumps(context, sort_keys=True)}\n"
@@ -1758,8 +1760,18 @@ class ProjectLoop:
         )
         selected_task_id = dispatch_decision.selected_task_id
         if selected_task_id is None:
-            has_pending = any(task.status == TaskStatus.PENDING for task in state_machine.tasks.values())
-            return {"complete": not has_pending, "current_task_id": None}
+            if eligible:
+                raise ValueError(
+                    f"dispatcher returned null task while ready_queue is non-empty: ready_queue={eligible}"
+                )
+            unresolved = [
+                task_id
+                for task_id, entry in state_machine.tasks.items()
+                if entry.status not in {TaskStatus.SHIPPED, TaskStatus.ABANDONED}
+            ]
+            if unresolved:
+                return {"halted": True, "complete": False, "current_task_id": None}
+            return {"complete": True, "halted": False, "current_task_id": None}
         if selected_task_id not in eligible:
             raise ValueError(
                 f"dispatcher selected task outside ready_queue: {selected_task_id}; ready_queue={eligible}"
@@ -1821,7 +1833,7 @@ class ProjectLoop:
             for task_id, entry in state_machine.tasks.items():
                 if entry.status != TaskStatus.BLOCKED:
                     continue
-                if any(state_machine.tasks[dep].status == TaskStatus.HALTED for dep in entry.depends_on):
+                if not all(state_machine.tasks[dep].status == TaskStatus.SHIPPED for dep in entry.depends_on):
                     continue
                 entry.status = TaskStatus.PENDING
                 changed = True
@@ -1836,6 +1848,8 @@ class ProjectLoop:
             task_state.halted_reason = resolution.rationale
         elif resolution.action == HumanResolutionAction.AMEND_SPEC:
             task_state.status = TaskStatus.PENDING
+            task_state.halted_reason = None
+            task_state.escalation_ref = None
             task_file = self.state_store.tasks_dir / f"{task_id}.md"
             original = task_file.read_text(encoding="utf-8")
             amendment = "\n\n## Amendment History\n"
@@ -1871,9 +1885,13 @@ class ProjectLoop:
                     ),
                 )
         elif resolution.action == HumanResolutionAction.REVISE_PLAN:
-            task_state.status = TaskStatus.IN_PROGRESS
+            task_state.status = TaskStatus.PENDING
+            task_state.halted_reason = None
+            task_state.escalation_ref = None
         elif resolution.action == HumanResolutionAction.PROVIDE_FIX:
-            task_state.status = TaskStatus.IN_PROGRESS
+            task_state.status = TaskStatus.PENDING
+            task_state.halted_reason = None
+            task_state.escalation_ref = None
             for path, content in resolution.fix_artifacts.items():
                 resolved = self.state_store.root / path.lstrip("/")
                 resolved.parent.mkdir(parents=True, exist_ok=True)
