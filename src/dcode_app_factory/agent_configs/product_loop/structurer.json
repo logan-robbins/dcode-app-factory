@@ -1,1 +1,1 @@
-{"stage":"product_loop","role":"structurer","model_tier":"frontier","temperature":0.0,"max_context_tokens":48000,"context_policy":"strict_pack","allowed_context_sections":["approved_research","spec_outline","task_taxonomy"]}
+{"stage":"product_loop","role":"structurer","model_tier":"frontier","temperature":0.0,"max_context_tokens":48000,"context_policy":"strict_pack","allowed_context_sections":["approved_research","spec_outline","task_taxonomy","validation_report"]}

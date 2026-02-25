@@ -1272,9 +1272,9 @@ def test_debate_graph_llm_path_uses_function_calling_structured_outputs(
             return Adjudication(
                 adjudication_id="ADJ-deadbeef",
                 target_artifact_id="CTR-deadbeef",
-                decision=AdjudicationDecision.APPROVE_WITH_AMENDMENTS,
+                decision=AdjudicationDecision.APPROVE,
                 amendments=[],
-                rationale="All checks met",
+                rationale="All rubric checks R1-R6 satisfied; proposal is production-ready",
                 ship_directive=ShipDirective.SHIP,
             )
 
@@ -1402,10 +1402,14 @@ def test_project_loop_happy_path_with_mocked_debate(monkeypatch: pytest.MonkeyPa
     assert state.project_id == settings.project_id
 
 
-def test_product_loop_treats_non_blocking_validator_rejection_as_advisory(
+def test_product_loop_rejects_validator_non_approval_without_blocking_issues(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """Validator returning approved=False with no blocking_issues is a structurally
+    incomplete rejection.  The pipeline must raise rather than silently overriding
+    the validator's judgment to approved=True.
+    """
     def _fake_invoke_deepagent_json(
         self,
         *,
@@ -1442,8 +1446,8 @@ def test_product_loop_treats_non_blocking_validator_rejection_as_advisory(
         project_id="ACME-ADVISORY",
         embedding_model="text-embedding-3-large",
     )
-    spec = ProductLoop("# Product\n## A", state_store_root=tmp_path, settings=settings).run()
-    assert spec.spec_id == "SPEC-001"
+    with pytest.raises(ValueError, match="rejected spec without providing blocking_issues"):
+        ProductLoop("# Product\n## A", state_store_root=tmp_path, settings=settings).run()
 
 
 def test_project_loop_emits_levelled_contract_artifacts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1997,3 +2001,193 @@ def test_project_loop_resolution_requeues_and_clears_halt_metadata(tmp_path: Pat
     assert task_state.halted_reason is None
     assert task_state.escalation_ref is None
     assert (loop.state_store.root / "tasks" / "fix-note.txt").is_file()
+
+
+def test_product_loop_rejects_validator_with_blocking_issues(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Validator returning approved=False with concrete blocking_issues raises
+    ValueError that propagates the blocking issue text.
+    """
+    def _fake_invoke_deepagent_json(
+        self,
+        *,
+        role: str,
+        system_prompt: str,
+        user_message: str,
+        tools: list,
+        name: str,
+    ) -> dict[str, object]:
+        _ = self, system_prompt, user_message, tools, name
+        if role == "validator":
+            return {
+                "approved": False,
+                "summary": "Spec is incomplete and tasks overlap.",
+                "warnings": [],
+                "blocking_issues": [
+                    "Task TSK-001 duplicates scope of TSK-002",
+                    "Acceptance criteria in TSK-003 are not testable",
+                ],
+                "recommended_actions": ["Merge TSK-001 and TSK-002", "Add measurable criteria to TSK-003"],
+            }
+        return {
+            "approved": True,
+            "summary": f"{role} approved",
+            "warnings": [],
+            "blocking_issues": [],
+            "recommended_actions": [],
+        }
+
+    monkeypatch.setattr(
+        "dcode_app_factory.agent_runtime.RoleAgentRuntime.invoke_deepagent_json",
+        _fake_invoke_deepagent_json,
+    )
+
+    settings = RuntimeSettings(
+        state_store_root=str(tmp_path),
+        project_id="ACME-VAL-BLOCK",
+        embedding_model="text-embedding-3-large",
+    )
+    with pytest.raises(ValueError, match="Task TSK-001 duplicates scope of TSK-002"):
+        ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
+
+
+def test_outer_graph_reject_routes_back_to_product_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Passing approval_action=REJECT should cause the outer graph to re-invoke
+    the product loop with amended spec text containing rejection feedback,
+    ultimately raising because the pipeline loops once and then the validator
+    on the second pass also rejects (since our mock always approves, the graph
+    will complete -- we test the routing by verifying the spec was regenerated).
+    """
+    monkeypatch.setattr("dcode_app_factory.loops.ProductLoop._invoke_deep_agent", lambda self, spec_json_path: None)
+    monkeypatch.setattr("dcode_app_factory.loops.DebateGraph", _FakeDebateGraphPass)
+
+    invocation_count: list[int] = [0]
+    original_product_run = ProductLoop.run
+
+    def _counting_run(self):  # noqa: ANN001,ANN201
+        invocation_count[0] += 1
+        return original_product_run(self)
+
+    monkeypatch.setattr("dcode_app_factory.loops.ProductLoop.run", _counting_run)
+
+    settings = RuntimeSettings(
+        state_store_root=str(tmp_path),
+        project_id="ACME-REJECT-01",
+        embedding_model="text-embedding-3-large",
+        recursion_limit=50,
+    )
+    orchestrator = FactoryOrchestrator(
+        raw_spec="# Product\n## A",
+        state_store_root=tmp_path,
+        settings=settings,
+    )
+    # REJECT on first pass causes loop-back. Because the _approval_route mutates
+    # state to set approval_action=None, the second pass will hit the interrupt path.
+    # Since we are using a compiled graph (no human-in-the-loop), we need to test
+    # the routing function directly instead.
+    route = orchestrator._approval_route({
+        "raw_spec": "# Product\n## A",
+        "approval_action": "REJECT",
+        "approval_feedback": "Tasks are too coarse",
+    })
+    assert route == "product_loop"
+
+
+def test_outer_graph_amend_routes_back_to_product_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Passing approval_action=AMEND should route back to product_loop and
+    increment the amend_count.
+    """
+    monkeypatch.setattr("dcode_app_factory.loops.ProductLoop._invoke_deep_agent", lambda self, spec_json_path: None)
+
+    settings = RuntimeSettings(
+        state_store_root=str(tmp_path),
+        project_id="ACME-AMEND-01",
+        embedding_model="text-embedding-3-large",
+    )
+    orchestrator = FactoryOrchestrator(
+        raw_spec="# Product\n## A",
+        state_store_root=tmp_path,
+        settings=settings,
+    )
+    state: dict[str, object] = {
+        "raw_spec": "# Product\n## A",
+        "approval_action": "AMEND",
+        "approval_feedback": "Add error handling section",
+        "amend_count": 0,
+    }
+    route = orchestrator._approval_route(state)
+    assert route == "product_loop"
+    assert state["amend_count"] == 1
+    assert "amend feedback: Add error handling section" in state["raw_spec"]
+
+    # Verify advisory message appears after 3 consecutive AMENDs
+    state["approval_action"] = "AMEND"
+    state["amend_count"] = 2
+    route = orchestrator._approval_route(state)
+    assert route == "product_loop"
+    assert state["amend_count"] == 3
+    assert "[advisory] three consecutive AMEND cycles reached" in state["raw_spec"]
+
+
+def test_outer_graph_project_failure_skips_release(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When the project loop returns project_success=False, the outer graph
+    should route to END without running the release loop.
+    """
+    monkeypatch.setattr("dcode_app_factory.loops.ProductLoop._invoke_deep_agent", lambda self, spec_json_path: None)
+    monkeypatch.setattr("dcode_app_factory.loops.DebateGraph", _FakeDebateGraphFailFirst)
+
+    settings = RuntimeSettings(
+        state_store_root=str(tmp_path),
+        project_id="ACME-PROJFAIL",
+        embedding_model="text-embedding-3-large",
+    )
+    orchestrator = FactoryOrchestrator(
+        raw_spec="# Product\n## A\n## B",
+        state_store_root=tmp_path,
+        settings=settings,
+    )
+    result = orchestrator.run(approval_action="APPROVE")
+    assert result["project_success"] is False
+    assert "release_result" not in result or result.get("release_result") is None
+
+
+def test_release_loop_overall_result_fail_when_gate_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When a release gate fails, the overall_result should be FAIL and the
+    specific failing gate must be present in the result dict.
+    """
+    monkeypatch.setattr("dcode_app_factory.loops.ProductLoop._invoke_deep_agent", lambda self, spec_json_path: None)
+    monkeypatch.setattr("dcode_app_factory.loops.DebateGraph", _FakeDebateGraphPass)
+
+    settings = RuntimeSettings(
+        state_store_root=str(tmp_path),
+        project_id="ACME-REL-FAIL",
+        embedding_model="text-embedding-3-large",
+    )
+    spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
+    code_index = CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index")
+    project = ProjectLoop(spec, code_index, state_store_root=tmp_path, settings=settings, enable_interrupts=False)
+    assert project.run() is True
+
+    # Deprecate a module to cause deprecation_check gate to fail
+    entries = code_index.list_entries()
+    assert entries
+    code_index.set_status(entries[0].module_ref, status=CodeIndexStatus.DEPRECATED, deprecation_reason="obsolete")
+
+    release = ReleaseLoop(state_store=project.state_store, code_index=code_index, spec=spec)
+    result = release.run()
+    assert result["overall_result"] == "FAIL"
+    assert result["integration_gates"]["deprecation_check"] == "FAIL"

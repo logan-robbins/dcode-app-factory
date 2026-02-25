@@ -1,1 +1,1 @@
-{"stage":"project_loop","role":"state_auditor","model_tier":"efficient","temperature":0.0,"max_context_tokens":16000,"context_policy":"immutable_log","allowed_context_sections":["state_transitions","task_statuses","code_index_events"]}
+{"stage":"project_loop","role":"state_auditor","model_tier":"frontier","temperature":0.0,"max_context_tokens":32000,"context_policy":"immutable_log","allowed_context_sections":["state_transitions","task_statuses","code_index_events","engineering_results","project_state"]}

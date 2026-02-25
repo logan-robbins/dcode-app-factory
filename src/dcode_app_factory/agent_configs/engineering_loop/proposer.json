@@ -1,1 +1,1 @@
-{"stage":"engineering_loop","role":"proposer","model_tier":"frontier","temperature":0.2,"max_context_tokens":24000,"context_policy":"context_pack_backend","allowed_context_sections":["task_contract","selected_interfaces","implementation_plan"]}
+{"stage":"engineering_loop","role":"proposer","model_tier":"frontier","temperature":0.2,"max_context_tokens":64000,"context_policy":"context_pack_backend","allowed_context_sections":["task_contract","selected_interfaces","implementation_plan","micro_plan","service_contracts","dependency_contracts"]}

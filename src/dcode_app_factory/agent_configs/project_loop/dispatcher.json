@@ -1,1 +1,1 @@
-{"stage":"project_loop","role":"dispatcher","model_tier":"efficient","temperature":0.0,"max_context_tokens":16000,"context_policy":"single_task_only","allowed_context_sections":["ready_queue","task_contract_summary","halt_policy"]}
+{"stage":"project_loop","role":"dispatcher","model_tier":"efficient","temperature":0.0,"max_context_tokens":16000,"context_policy":"single_task_only","allowed_context_sections":["ready_queue","task_contract_summary","halt_policy","task_statuses"]}

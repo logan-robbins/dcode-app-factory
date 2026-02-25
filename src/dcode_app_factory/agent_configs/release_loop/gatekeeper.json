@@ -1,1 +1,1 @@
-{"stage":"release_loop","role":"gatekeeper","model_tier":"efficient","temperature":0.0,"max_context_tokens":12000,"context_policy":"read_only_validation","allowed_context_sections":["integration_gates","debate_outcomes","failing_tasks"]}
+{"stage":"release_loop","role":"gatekeeper","model_tier":"frontier","temperature":0.0,"max_context_tokens":32000,"context_policy":"read_only_validation","allowed_context_sections":["integration_gates","debate_outcomes","failing_tasks","module_contracts","ship_evidence","dependency_closure"]}

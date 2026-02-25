@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
 from datetime import UTC, datetime
@@ -13,6 +14,22 @@ from .canonical import to_canonical_json
 
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 TASK_ID_RE = re.compile(r"^(TSK-\d+|T-[a-z0-9-]+-[a-z0-9-]+-[a-z0-9-]+-\d+)$")
+
+# Exact-match placeholder tokens (case-insensitive after strip + lower)
+_PLACEHOLDER_EXACT: frozenset[str] = frozenset({
+    "tbd", "todo", "n/a", "na", "none", "placeholder", "stub", "mock",
+    "tba", "fixme", "xxx", "...", "pending", "unimplemented",
+    "not implemented", "replace me", "change me", "update this",
+    "fill in later", "to be determined", "to be defined",
+})
+
+# Substring patterns that indicate placeholder content within longer text
+_PLACEHOLDER_SUBSTR_RE: re.Pattern[str] = re.compile(
+    r"\b(TODO|FIXME|STUB|MOCK|PLACEHOLDER|TBD|HACK|XXX)\b",
+    re.IGNORECASE,
+)
+
+_MIN_SUBSTANTIVE_LENGTH: int = 10
 
 
 class Severity(StrEnum):
@@ -283,13 +300,25 @@ class IOContractSketch(BaseModel):
 
     @model_validator(mode="after")
     def validate_non_empty(self) -> "IOContractSketch":
-        placeholders = {"tbd", "todo", "n/a", "na", "none", "placeholder"}
+        """Reject empty, placeholder, or trivially short field values."""
         for key in ("inputs", "outputs", "error_surfaces", "effects", "modes"):
             value = getattr(self, key).strip()
             if not value:
                 raise ValueError(f"io_contract_sketch.{key} must be non-empty")
-            if value.lower() in placeholders:
-                raise ValueError(f"io_contract_sketch.{key} cannot be placeholder text")
+            if value.lower() in _PLACEHOLDER_EXACT:
+                raise ValueError(
+                    f"io_contract_sketch.{key} cannot be placeholder text (got {value!r})"
+                )
+            if _PLACEHOLDER_SUBSTR_RE.search(value):
+                raise ValueError(
+                    f"io_contract_sketch.{key} contains placeholder token "
+                    f"(matched {_PLACEHOLDER_SUBSTR_RE.search(value).group()!r})"  # type: ignore[union-attr]
+                )
+            if len(value) < _MIN_SUBSTANTIVE_LENGTH:
+                raise ValueError(
+                    f"io_contract_sketch.{key} must be at least {_MIN_SUBSTANTIVE_LENGTH} "
+                    f"characters (got {len(value)})"
+                )
         return self
 
 
@@ -613,6 +642,7 @@ class ServiceContract(BaseModel):
     @computed_field(return_type=str)
     @property
     def interface_fingerprint(self) -> str:
+        """SHA-256 hex digest of the canonical JSON of interface-defining fields."""
         payload = {
             "inputs": self.inputs,
             "outputs": self.outputs,
@@ -621,8 +651,6 @@ class ServiceContract(BaseModel):
             "modes": self.modes,
         }
         canonical = to_canonical_json(payload)
-        import hashlib
-
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -656,14 +684,13 @@ class ClassContract(BaseModel):
     @computed_field(return_type=str)
     @property
     def interface_fingerprint(self) -> str:
+        """SHA-256 hex digest of the canonical JSON of interface-defining fields."""
         payload = {
             "methods": [entry.model_dump(mode="json") for entry in self.methods],
             "invariants": self.invariants,
             "error_surfaces": self.error_surfaces,
         }
         canonical = to_canonical_json(payload)
-        import hashlib
-
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -705,6 +732,7 @@ class MicroModuleContract(BaseModel):
     @computed_field(return_type=str)
     @property
     def interface_fingerprint(self) -> str:
+        """SHA-256 hex digest of the canonical JSON of interface-defining fields."""
         payload = {
             "inputs": [entry.model_dump(mode="json") for entry in self.inputs],
             "outputs": [entry.model_dump(mode="json") for entry in self.outputs],
@@ -713,8 +741,6 @@ class MicroModuleContract(BaseModel):
             "modes": self.modes.model_dump(by_alias=True, mode="json"),
         }
         canonical = to_canonical_json(payload)
-        import hashlib
-
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -887,9 +913,48 @@ class Proposal(BaseModel):
 
     proposal_id: str = Field(pattern=r"^PROP-[0-9a-f]{8}$")
     target_artifact_id: str
-    claim: str
+    claim: str = Field(
+        min_length=10,
+        description="A substantive claim describing what the implementation achieves.",
+    )
     deliverable_ref: str
-    acceptance_checks: list[str] = Field(min_length=1)
+    acceptance_checks: list[str] = Field(
+        min_length=1,
+        description="List of specific, executable acceptance criteria for the proposal.",
+    )
+
+    @field_validator("claim")
+    @classmethod
+    def validate_claim_not_placeholder(cls, value: str) -> str:
+        """Reject placeholder or trivially short claims."""
+        stripped = value.strip()
+        if stripped.lower() in _PLACEHOLDER_EXACT:
+            raise ValueError(f"claim cannot be placeholder text (got {value!r})")
+        if _PLACEHOLDER_SUBSTR_RE.search(stripped):
+            raise ValueError(
+                f"claim contains placeholder token "
+                f"(matched {_PLACEHOLDER_SUBSTR_RE.search(stripped).group()!r})"  # type: ignore[union-attr]
+            )
+        return value
+
+    @field_validator("acceptance_checks")
+    @classmethod
+    def validate_acceptance_checks_substantive(cls, value: list[str]) -> list[str]:
+        """Each acceptance check must be specific and executable (min 10 chars)."""
+        for idx, check in enumerate(value):
+            stripped = check.strip()
+            if not stripped:
+                raise ValueError(f"acceptance_checks[{idx}] must be non-empty")
+            if len(stripped) < _MIN_SUBSTANTIVE_LENGTH:
+                raise ValueError(
+                    f"acceptance_checks[{idx}] must be at least {_MIN_SUBSTANTIVE_LENGTH} "
+                    f"characters (got {len(stripped)})"
+                )
+            if stripped.lower() in _PLACEHOLDER_EXACT:
+                raise ValueError(
+                    f"acceptance_checks[{idx}] cannot be placeholder text (got {check!r})"
+                )
+        return value
 
 
 class ChallengeFailure(BaseModel):
@@ -920,12 +985,17 @@ class Challenge(BaseModel):
 
     @model_validator(mode="after")
     def validate_rubric(self) -> "Challenge":
+        """Enforce rubric completeness and verdict/failure consistency."""
         criteria = {entry.criterion for entry in self.rubric_assessments}
         if criteria != {"R1", "R2", "R3", "R4", "R5", "R6"}:
             raise ValueError("rubric_assessments must include exactly R1..R6")
         has_not_met = any(entry.assessment == "NOT_MET" for entry in self.rubric_assessments)
         if has_not_met and self.verdict != DebateVerdict.FAIL:
             raise ValueError("challenge verdict must be FAIL when any rubric assessment is NOT_MET")
+        if self.verdict == DebateVerdict.FAIL and not self.failures:
+            raise ValueError(
+                "challenge with verdict=FAIL must include at least one failure entry"
+            )
         return self
 
 
@@ -950,8 +1020,28 @@ class Adjudication(BaseModel):
     target_artifact_id: str
     decision: AdjudicationDecision
     amendments: list[AdjudicationAmendment] = Field(default_factory=list)
-    rationale: str
+    rationale: str = Field(
+        min_length=1,
+        description="Non-empty reasoning for the adjudication decision.",
+    )
     ship_directive: ShipDirective
+
+    @model_validator(mode="after")
+    def validate_decision_consistency(self) -> "Adjudication":
+        """Enforce cross-field invariants for adjudication decisions."""
+        if not self.rationale.strip():
+            raise ValueError("adjudication rationale must be non-empty (not just whitespace)")
+        if self.decision == AdjudicationDecision.REJECT and self.ship_directive != ShipDirective.NO_SHIP:
+            raise ValueError(
+                "adjudication with decision=REJECT must have ship_directive=NO_SHIP "
+                f"(got {self.ship_directive.value})"
+            )
+        if self.decision == AdjudicationDecision.APPROVE_WITH_AMENDMENTS and not self.amendments:
+            raise ValueError(
+                "adjudication with decision=APPROVE_WITH_AMENDMENTS must include "
+                "at least one amendment"
+            )
+        return self
 
 
 class DebateTrail(BaseModel):

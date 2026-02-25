@@ -1,1 +1,1 @@
-{"stage":"engineering_loop","role":"challenger","model_tier":"frontier","temperature":0.0,"max_context_tokens":24000,"context_policy":"context_pack_backend","allowed_context_sections":["proposal_artifact","acceptance_criteria","falsification_checks"]}
+{"stage":"engineering_loop","role":"challenger","model_tier":"frontier","temperature":0.0,"max_context_tokens":32000,"context_policy":"context_pack_backend","allowed_context_sections":["proposal_artifact","acceptance_criteria","falsification_checks","module_contract","service_contracts","io_contract_sketch"]}

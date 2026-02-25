@@ -35,16 +35,19 @@ def get_agent_config_dir(stage: str) -> Path:
 
 
 def load_agent_config(path: Path) -> AgentConfig:
+    """Load and validate an AgentConfig from a JSON file on disk."""
     return AgentConfig.model_validate_json(path.read_text(encoding="utf-8"))
 
 
 def slugify_name(name: str, *, max_length: int = 24) -> str:
+    """Convert a human-readable name to a lowercase hyphenated slug, capped at max_length."""
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", name.lower()).strip("-")
     slug = re.sub(r"-{2,}", "-", slug)
     return slug[:max_length].rstrip("-")
 
 
 def dedupe_slug(base_slug: str, used: set[str], *, max_length: int = 24) -> str:
+    """Return a unique slug by appending a suffix if base_slug is already in used."""
     if base_slug not in used:
         used.add(base_slug)
         return base_slug
@@ -62,6 +65,7 @@ def dedupe_slug(base_slug: str, used: set[str], *, max_length: int = 24) -> str:
 
 
 def validate_task_dependency_dag(spec: ProductSpec) -> None:
+    """Verify the task dependency graph is a valid DAG with no unknown references."""
     tasks = {task.task_id: task for task in spec.iter_tasks()}
     indegree = {task_id: 0 for task_id in tasks}
     edges: dict[str, list[str]] = defaultdict(list)
@@ -88,7 +92,34 @@ def validate_task_dependency_dag(spec: ProductSpec) -> None:
 
 
 def validate_spec(spec: ProductSpec) -> ValidationReport:
+    """Validate a ProductSpec for structural completeness and quality.
+
+    This function is called both programmatically during spec creation and by
+    agent tools during the product loop review.  It must catch every deficiency
+    that would cause downstream engineering failures.
+    """
     issues: list[ValidationIssue] = []
+
+    # -- Top-level field checks --
+    if not spec.title.strip():
+        issues.append(
+            ValidationIssue(
+                severity=Severity.ERROR,
+                path="title",
+                field="title",
+                message="Spec title must be non-empty",
+            )
+        )
+
+    if len(spec.description.strip()) < 50:
+        issues.append(
+            ValidationIssue(
+                severity=Severity.ERROR,
+                path="description",
+                field="description",
+                message="Spec description must be at least 50 characters of substantive content",
+            )
+        )
 
     if not spec.pillars:
         issues.append(
@@ -100,9 +131,40 @@ def validate_spec(spec: ProductSpec) -> ValidationReport:
             )
         )
 
+    # -- Pillar name uniqueness --
+    pillar_names: set[str] = set()
+    for p_idx, pillar in enumerate(spec.pillars):
+        p_name_lower = pillar.name.strip().lower()
+        if p_name_lower in pillar_names:
+            issues.append(
+                ValidationIssue(
+                    severity=Severity.ERROR,
+                    path=f"pillars[{p_idx}]",
+                    field="name",
+                    message=f"Duplicate pillar name: {pillar.name}",
+                )
+            )
+        pillar_names.add(p_name_lower)
+
     task_ids: set[str] = set()
     for p_idx, pillar in enumerate(spec.pillars):
         p_path = f"pillars[{p_idx}]"
+
+        # -- Epic name uniqueness within pillar --
+        epic_names: set[str] = set()
+        for e_idx, epic in enumerate(pillar.epics):
+            e_name_lower = epic.name.strip().lower()
+            if e_name_lower in epic_names:
+                issues.append(
+                    ValidationIssue(
+                        severity=Severity.ERROR,
+                        path=f"{p_path}.epics[{e_idx}]",
+                        field="name",
+                        message=f"Duplicate epic name within pillar: {epic.name}",
+                    )
+                )
+            epic_names.add(e_name_lower)
+
         if not pillar.epics:
             issues.append(
                 ValidationIssue(
@@ -133,6 +195,21 @@ def validate_spec(spec: ProductSpec) -> ValidationReport:
                         message="Every epic must include at least one success criterion",
                     )
                 )
+
+            # -- Story name uniqueness within epic --
+            story_names: set[str] = set()
+            for s_idx, story in enumerate(epic.stories):
+                s_name_lower = story.name.strip().lower()
+                if s_name_lower in story_names:
+                    issues.append(
+                        ValidationIssue(
+                            severity=Severity.ERROR,
+                            path=f"{e_path}.stories[{s_idx}]",
+                            field="name",
+                            message=f"Duplicate story name within epic: {story.name}",
+                        )
+                    )
+                story_names.add(s_name_lower)
 
             for s_idx, story in enumerate(epic.stories):
                 s_path = f"{e_path}.stories[{s_idx}]"
@@ -189,15 +266,37 @@ def validate_spec(spec: ProductSpec) -> ValidationReport:
                                 )
                             )
 
-                    if len(task.description.strip()) < 20:
+                    if len(task.description.strip()) < 30:
                         issues.append(
                             ValidationIssue(
-                                severity=Severity.WARNING,
+                                severity=Severity.ERROR,
                                 path=t_path,
                                 field="description",
-                                message="Description should be at least 20 characters",
+                                message="Task description must be at least 30 characters of substantive content",
                             )
                         )
+
+                    for st_idx, subtask_text in enumerate(task.subtasks):
+                        if len(subtask_text.strip()) < 10:
+                            issues.append(
+                                ValidationIssue(
+                                    severity=Severity.ERROR,
+                                    path=t_path,
+                                    field=f"subtasks[{st_idx}]",
+                                    message="Each subtask must be at least 10 characters of meaningful content",
+                                )
+                            )
+
+                    for ac_idx, criterion_text in enumerate(task.acceptance_criteria):
+                        if len(criterion_text.strip()) < 10:
+                            issues.append(
+                                ValidationIssue(
+                                    severity=Severity.ERROR,
+                                    path=t_path,
+                                    field=f"acceptance_criteria[{ac_idx}]",
+                                    message="Each acceptance criterion must be at least 10 characters of meaningful content",
+                                )
+                            )
 
                     for criterion in task.acceptance_criteria:
                         if not TESTABLE_VERB_RE.search(criterion):
@@ -233,6 +332,16 @@ def validate_spec(spec: ProductSpec) -> ValidationReport:
 
     by_task = {task.task_id: task for task in spec.iter_tasks()}
     for task in spec.iter_tasks():
+        # Self-referencing dependency check
+        if task.task_id in task.depends_on:
+            issues.append(
+                ValidationIssue(
+                    severity=Severity.ERROR,
+                    path=task.task_id,
+                    field="depends_on",
+                    message=f"Task {task.task_id} depends on itself",
+                )
+            )
         for dep in task.depends_on:
             if dep not in by_task:
                 issues.append(
@@ -263,6 +372,7 @@ def validate_spec(spec: ProductSpec) -> ValidationReport:
 
 
 def emit_structured_spec(spec: ProductSpec, path: Path) -> Path:
+    """Validate and write a ProductSpec to disk as indented JSON. Returns the written path."""
     report = validate_spec(spec)
     if report.errors:
         deficiency = "; ".join(f"{entry.path}:{entry.field} {entry.message}" for entry in report.errors)
@@ -273,6 +383,7 @@ def emit_structured_spec(spec: ProductSpec, path: Path) -> Path:
 
 
 def render_spec_markdown(spec: ProductSpec) -> str:
+    """Render a ProductSpec as a human-readable Markdown document."""
     lines: list[str] = [f"# {spec.title}", "", spec.description, ""]
     for pillar in spec.pillars:
         lines.extend([f"## {pillar.name}", pillar.description, "", f"Rationale: {pillar.rationale}", ""])
@@ -305,6 +416,7 @@ def render_spec_markdown(spec: ProductSpec) -> str:
 
 
 def normalize_request_kind(request_kind: str) -> str:
+    """Normalize and validate a request kind string. Raises ValueError if invalid."""
     normalized = request_kind.strip().upper()
     if normalized not in REQUEST_KIND_VALUES:
         choices = ", ".join(sorted(REQUEST_KIND_VALUES))
@@ -342,21 +454,58 @@ def _invoke_product_spec_planner(
     target_scope = target_codebase_root or "current workspace checkout"
     prompt = (
         "You are the ProductSpec planner for a production software factory. "
-        "Return ProductSpec JSON only; do not wrap in markdown.\n"
-        f"spec_id must be exactly {spec_id}\n"
-        "spec_version must be exactly 1.0.0\n"
+        "Your output is a structured ProductSpec JSON that will be machine-validated and "
+        "then reviewed by researcher, structurer, and validator agents before reaching "
+        "engineering. If your output fails validation, the pipeline halts.\n\n"
+        "Return ProductSpec JSON only; do not wrap in markdown.\n\n"
+        f"spec_id must be exactly: {spec_id}\n"
+        "spec_version must be exactly: 1.0.0\n"
         f"request_kind hint: {kind_hint}\n"
         f"target_codebase_root: {target_scope}\n"
-        f"current_time_utc: {now_iso}\n"
-        "Hard requirements:\n"
-        "- Include at least 1 pillar, epic, story, and task.\n"
-        "- Use task IDs in TSK-NNN format (e.g., TSK-001) before canonical remapping.\n"
+        f"current_time_utc: {now_iso}\n\n"
+        "STRUCTURAL REQUIREMENTS (violations cause hard failures):\n"
+        "- At least 1 pillar, each with at least 1 epic, each with at least 1 story, "
+        "each with at least 1 task.\n"
+        "- Use task IDs in TSK-NNN format (e.g., TSK-001). These will be canonically remapped.\n"
         "- Every task must have >=2 subtasks and >=2 acceptance criteria.\n"
-        "- Every task must include non-placeholder io_contract_sketch fields.\n"
-        "- Do not propose mock/stub/fake/placeholder implementation paths.\n"
-        "- Task depends_on values must reference existing task IDs and be acyclic.\n"
-        "- Make acceptance criteria testable and implementation-oriented.\n"
-        "Raw request follows:\n"
+        "- Every task must include all io_contract_sketch fields (inputs, outputs, "
+        "error_surfaces, effects, modes) as non-empty, non-placeholder strings.\n"
+        "- Task depends_on values must reference existing task IDs and form an acyclic DAG.\n"
+        "- No task may list itself in its own depends_on.\n"
+        "- Pillar names must be unique. Epic names must be unique within their pillar. "
+        "Story names must be unique within their epic.\n\n"
+        "QUALITY REQUIREMENTS (violations cause reviewer rejections):\n"
+        "- Title must clearly describe the product or feature being built.\n"
+        "- Description must be a substantive paragraph (>=50 characters) explaining scope "
+        "and purpose, not a restatement of the title.\n"
+        "- Each pillar must represent a distinct architectural concern (e.g., data layer, "
+        "API surface, auth/identity, observability) -- not a restatement of another pillar.\n"
+        "- Each pillar must have a non-trivial rationale explaining why it is a separate concern.\n"
+        "- Each epic must have at least one concrete success criterion that is measurable.\n"
+        "- Each story must describe user-observable behaviour, not implementation steps.\n"
+        "- Each task description must be >=30 characters of real content explaining WHAT "
+        "the task delivers and WHY.\n"
+        "- Subtasks must collectively cover the task scope. Each subtask must be a distinct "
+        "action, not a restatement of another subtask.\n"
+        "- Acceptance criteria must use testable/observable verbs (returns, displays, raises, "
+        "writes, emits, rejects, validates, produces, creates, records, updates). Each "
+        "criterion must specify the expected observable outcome.\n"
+        "- io_contract_sketch fields must specify concrete types and formats:\n"
+        "  - inputs: name the data types, sources, and required fields.\n"
+        "  - outputs: name the data types, formats, and destination.\n"
+        "  - error_surfaces: list specific error conditions and how they manifest.\n"
+        "  - effects: describe observable side effects (file writes, DB mutations, API calls).\n"
+        "  - modes: describe operational modes or feature flags if applicable, or 'single-mode' "
+        "    with justification.\n"
+        "- Dependencies must be justified: only add depends_on when task B literally cannot "
+        "start without task A's output. Do not add dependencies for convenience.\n\n"
+        "PROHIBITED PATTERNS:\n"
+        "- No mock, stub, fake, or placeholder implementations.\n"
+        "- No 'TBD', 'TODO', 'N/A', 'any', or 'data' as io_contract_sketch values.\n"
+        "- No generic names like 'Pillar 1', 'Epic A', 'Story X', 'Task 1'.\n"
+        "- No duplicate subtask text within a task.\n"
+        "- No acceptance criteria that are untestable opinions (e.g., 'code is clean').\n\n"
+        "RAW REQUEST:\n"
         f"{raw_request}"
     )
     return planner.invoke(prompt)
@@ -369,6 +518,15 @@ def parse_raw_request_to_product_spec(
     request_kind: str = "AUTO",
     target_codebase_root: str | None = None,
 ) -> ProductSpec:
+    """Parse a raw text request into a validated ProductSpec via LLM-driven planning.
+
+    Invokes the frontier model to generate a structured ProductSpec, then validates
+    the result for structural completeness and DAG integrity.
+
+    Raises:
+        ValueError: If the raw_request is empty, kind is invalid, or the generated
+            spec fails validation.
+    """
     if not raw_request.strip():
         raise ValueError("raw_request must be non-empty")
     normalized_kind = normalize_request_kind(request_kind)
@@ -392,6 +550,7 @@ def parse_raw_request_to_product_spec(
 
 
 def parse_raw_spec_to_product_spec(raw_spec: str, *, spec_id: str = "SPEC-001") -> ProductSpec:
+    """Convenience wrapper: parse a raw spec as a FULL_APP request kind."""
     return parse_raw_request_to_product_spec(raw_spec, spec_id=spec_id, request_kind="FULL_APP")
 
 
@@ -463,6 +622,7 @@ def resolve_task_ids(spec: ProductSpec) -> dict[str, str]:
 
 
 def apply_canonical_task_ids(spec: ProductSpec) -> ProductSpec:
+    """Replace all task IDs in the spec with canonical hierarchical IDs in place."""
     mapping = resolve_task_ids(spec)
     for task in spec.iter_tasks():
         old = task.task_id
@@ -473,9 +633,11 @@ def apply_canonical_task_ids(spec: ProductSpec) -> ProductSpec:
 
 
 def to_json_file(data: dict[str, object], path: Path) -> None:
+    """Write a dictionary to a JSON file with sorted keys and 2-space indent."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def from_json_file(path: Path) -> dict[str, object]:
+    """Read and parse a JSON file, returning the deserialized dictionary."""
     return json.loads(path.read_text(encoding="utf-8"))

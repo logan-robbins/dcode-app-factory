@@ -160,29 +160,159 @@ class ProductLoop:
             "recommended_actions": cls._coerce_string_list(payload.get("recommended_actions")),
         }
 
+    @staticmethod
+    def _build_role_system_prompt(role: str, role_context: str) -> str:
+        """Build a substantive, contract-enforcing system prompt for a product loop role.
+
+        Each role has distinct duties and enforcement criteria.  The prompts are
+        intentionally long because they drive real agent behaviour in production.
+        A thin prompt produces thin output; a precise prompt enforces the contract.
+        """
+        response_contract = (
+            "You must return a single JSON object conforming to ProductRoleReport "
+            "with exact keys: approved (bool), summary (str), warnings (list[str]), "
+            "blocking_issues (list[str]), recommended_actions (list[str]). "
+            "Do not wrap the JSON in markdown fences. Do not include keys beyond these five. "
+            "If you set approved=false you MUST populate blocking_issues with at least one "
+            "concrete, actionable issue string describing what must change before approval."
+        )
+
+        if role == "researcher":
+            return (
+                "You are the Researcher agent in the Product Loop of a production software factory. "
+                "Your sole job is reuse-first discovery: before the factory builds anything new, "
+                "you must determine whether the requested functionality already exists -- as an "
+                "open-source library, an internal module in the code index, or a market product "
+                "that can be integrated rather than rebuilt.\n\n"
+                "MANDATORY STEPS (you must execute ALL of these before rendering your report):\n"
+                "1. Call search_code_index for every major capability described in the spec. "
+                "Record which capabilities already have internal implementations.\n"
+                "2. Call web_search for each capability that is NOT covered by the code index. "
+                "Search for: existing open-source libraries, SaaS APIs, and published reference "
+                "architectures that could replace building from scratch.\n"
+                "3. For each task in the spec, classify it as: REUSE_INTERNAL (found in code "
+                "index), REUSE_EXTERNAL (viable open-source/API candidate found), or BUILD_NEW "
+                "(no viable reuse candidate). If you classify a task as BUILD_NEW you must have "
+                "searched at least two different queries with no viable result.\n"
+                "4. If more than 60 percent of tasks are BUILD_NEW, add a warning that the spec "
+                "may be reinventing the wheel.\n"
+                "5. If any task proposes building something that already exists in the code index, "
+                "set approved=false and add a blocking_issue identifying the duplicate.\n\n"
+                "ENFORCEMENT:\n"
+                "- You MUST call search_code_index at least once. If you skip it, your report is invalid.\n"
+                "- You MUST call web_search at least once. If you skip it, your report is invalid.\n"
+                "- Do not recommend mock, stub, fake, or placeholder implementations.\n"
+                "- Do not speculate about capabilities -- search and cite evidence.\n\n"
+                f"{response_contract}\n"
+                f"{role_context}"
+            )
+
+        if role == "structurer":
+            return (
+                "You are the Structurer agent in the Product Loop of a production software factory. "
+                "Your sole job is to verify that the ProductSpec is structurally sound and that "
+                "the task decomposition is production-ready.\n\n"
+                "MANDATORY STEPS (you must execute ALL of these before rendering your report):\n"
+                "1. Call validate_spec_tool on the spec JSON path to run schema and completeness "
+                "validation. If there are any ERROR-level issues, set approved=false and copy "
+                "every error into blocking_issues verbatim.\n"
+                "2. Review the pillar/epic/story/task hierarchy for logical coherence:\n"
+                "   - Each pillar must represent a distinct architectural concern, not a restatement.\n"
+                "   - Epics under a pillar must partition the pillar's scope without overlap.\n"
+                "   - Stories must represent user-observable behaviour, not implementation steps.\n"
+                "   - Tasks must be independently implementable units with clear I/O boundaries.\n"
+                "3. Verify task decomposition quality:\n"
+                "   - Each task's subtasks must collectively cover the task scope without gaps.\n"
+                "   - Acceptance criteria must be testable (contain measurable/observable verbs).\n"
+                "   - I/O contract sketches must specify concrete types (not 'TBD', 'any', 'data').\n"
+                "   - Task dependencies (depends_on) must be justified; flag circular or missing deps.\n"
+                "4. Verify naming quality:\n"
+                "   - No duplicate pillar, epic, or story names.\n"
+                "   - Names must be descriptive (not 'Pillar 1', 'Epic A', 'Story X').\n"
+                "5. Check the researcher's prior report. If the researcher flagged reuse candidates, "
+                "verify the spec reflects those recommendations (tasks should integrate, not rebuild).\n\n"
+                "ENFORCEMENT:\n"
+                "- You MUST call validate_spec on the spec. If you skip validation your report is invalid.\n"
+                "- If validate_spec returns any ERROR-level issues, you MUST set approved=false.\n"
+                "- Do not approve specs with placeholder I/O contracts or generic acceptance criteria.\n"
+                "- Do not approve specs where tasks lack clear boundaries between them.\n\n"
+                f"{response_contract}\n"
+                f"{role_context}"
+            )
+
+        if role == "validator":
+            return (
+                "You are the Validator agent in the Product Loop of a production software factory. "
+                "You are the FINAL GATE before the spec proceeds to engineering. Your rejection "
+                "halts the pipeline. Your approval means you accept professional responsibility "
+                "that this spec is ready for implementation.\n\n"
+                "MANDATORY STEPS (you must execute ALL of these before rendering your report):\n"
+                "1. Call validate_spec_tool on the spec JSON path. If there are ANY ERROR-level "
+                "issues, you MUST set approved=false. No exceptions.\n"
+                "2. Review the researcher report (in prior role outputs). Verify:\n"
+                "   - The researcher actually called search_code_index and web_search (check the summary).\n"
+                "   - If the researcher flagged reuse opportunities, the spec reflects them.\n"
+                "   - If the researcher rejected the spec, you must also reject unless the structurer "
+                "     resolved the researcher's blocking_issues.\n"
+                "3. Review the structurer report (in prior role outputs). Verify:\n"
+                "   - The structurer actually called validate_spec (check the summary).\n"
+                "   - All structural blocking_issues from the structurer are resolved.\n"
+                "4. Apply your own final checks:\n"
+                "   - Every task must have a non-trivial description (>=30 characters of real content).\n"
+                "   - The spec must have a coherent title and description that match the request.\n"
+                "   - No task should duplicate another task's scope.\n"
+                "   - The dependency graph must be minimal (no unnecessary dependencies).\n"
+                "   - No task proposes mock/stub/fake/placeholder implementations.\n"
+                "   - Total task count must be reasonable for the request scope.\n"
+                "5. If ALL checks pass, set approved=true with a summary of what you verified.\n"
+                "   If ANY check fails, set approved=false and populate blocking_issues.\n\n"
+                "ENFORCEMENT:\n"
+                "- You MUST call validate_spec. If you skip it, your report is invalid.\n"
+                "- If you set approved=false, you MUST provide at least one blocking_issue. "
+                "A rejection without blocking_issues is a structurally invalid report and will "
+                "be treated as an error.\n"
+                "- You cannot approve a spec that either the researcher or structurer rejected "
+                "unless you explicitly address each of their blocking_issues in your summary.\n"
+                "- Do not rubber-stamp. If you approve without evidence of having checked, the "
+                "pipeline will flag your report as non-compliant.\n\n"
+                f"{response_contract}\n"
+                f"{role_context}"
+            )
+
+        raise ValueError(f"Unknown product loop role: {role}")
+
     def _invoke_deep_agent(self, spec_json_path: Path) -> dict[str, ProductRoleReport]:
+        """Execute researcher, structurer, and validator agents sequentially.
+
+        Each role receives its own substantive system prompt and can see prior role
+        outputs so that later roles can verify earlier ones did their jobs.
+        """
         reports: dict[str, ProductRoleReport] = {}
-        role_specs = {
-            "researcher": "web and market-reuse discovery",
-            "structurer": "spec structure quality and task decomposition review",
-            "validator": "final product-loop release-readiness gate",
+        role_objectives = {
+            "researcher": (
+                "Perform reuse-first discovery. Search the code index and web for every major "
+                "capability in the spec. Classify each task as REUSE_INTERNAL, REUSE_EXTERNAL, "
+                "or BUILD_NEW. Block if tasks duplicate existing code index entries."
+            ),
+            "structurer": (
+                "Validate spec structure and task decomposition quality. Run validate_spec, "
+                "check hierarchy coherence, verify I/O contracts are concrete, and confirm the "
+                "researcher's reuse recommendations are reflected in the spec."
+            ),
+            "validator": (
+                "Final release-readiness gate. Run validate_spec, review researcher and structurer "
+                "reports, apply your own final checks, and decide whether the spec is ready for "
+                "engineering implementation. Your rejection halts the pipeline."
+            ),
         }
 
         for role in ("researcher", "structurer", "validator"):
             role_context = self.role_runtime.role_context_line(role)
             prior_context = {k: v.model_dump(mode="json") for k, v in reports.items()}
-            system_prompt = (
-                f"You are the Product Loop {role} role for a production software factory. "
-                "Operate with contract-first, reuse-first, and no speculative output. "
-                "Do not recommend mock/stub/fake implementations or placeholder contracts. "
-                "You must return a single JSON object for ProductRoleReport with exact keys only: "
-                "approved, summary, warnings, blocking_issues, recommended_actions. "
-                f"{role_context} "
-                "Use tools when needed, and call validate_spec plus search_code_index before any create-new recommendation."
-            )
+            system_prompt = self._build_role_system_prompt(role, role_context)
             user_message = (
                 "Review the ProductSpec artifact and provide your role decision.\n"
-                f"Role objective: {role_specs[role]}.\n"
+                f"Role objective: {role_objectives[role]}\n"
                 f"Request kind: {self.request_kind}.\n"
                 f"Target codebase root: {self.target_codebase_root or 'current workspace'}.\n"
                 f"Spec JSON path: {spec_json_path}\n"
@@ -206,15 +336,17 @@ class ProductLoop:
 
         validator = reports["validator"]
         if not validator.approved:
-            if not validator.blocking_issues:
-                validator.approved = True
-                validator.recommended_actions.append(
-                    "Validator returned non-approval without blocking_issues; treated as advisory and execution continued."
-                )
-                reports["validator"] = validator
-                return reports
-            issues = "; ".join(validator.blocking_issues) or validator.summary
-            raise ValueError(f"Product role validator rejected spec: {issues}")
+            if validator.blocking_issues:
+                issues = "; ".join(validator.blocking_issues)
+                raise ValueError(f"Product role validator rejected spec: {issues}")
+            # Validator returned approved=False with no blocking_issues.
+            # This is a structurally incomplete rejection -- the validator failed to
+            # articulate why it rejected.  Treat as a hard error so the issue surfaces
+            # rather than silently overriding the validator's judgment.
+            raise ValueError(
+                f"Product role validator rejected spec without providing blocking_issues. "
+                f"Validator summary: {validator.summary}"
+            )
         return reports
 
     def run(self) -> ProductSpec:
@@ -764,10 +896,45 @@ class EngineeringLoop:
             role="micro_planner",
             schema=MicroPlanReview,
             prompt=(
-                "You are the micro_planner role in Engineering Loop. "
-                f"{self.role_runtime.role_context_line('micro_planner')} "
-                "Validate that this micro plan is atomic, dependency-safe, and contract-aligned. "
-                "Return MicroPlanReview JSON only.\n"
+                "You are the micro_planner role in the Engineering Loop of a production software factory.\n"
+                f"{self.role_runtime.role_context_line('micro_planner')}\n\n"
+                "YOUR ROLE: You are the architectural quality gate for micro plans. A micro plan decomposes\n"
+                "a single task into ordered, atomic modules with explicit I/O contracts, dependency chains,\n"
+                "and reuse decisions. Your approval means you accept professional responsibility that this\n"
+                "plan is implementable, dependency-safe, and contract-aligned.\n\n"
+                "MANDATORY REASONING STEPS (execute ALL before rendering your decision):\n"
+                "1. ATOMICITY CHECK: Verify each module has exactly one purpose. If a module combines\n"
+                "   multiple concerns (e.g., validation AND persistence), set approved=false and add a blocker.\n"
+                "2. DEPENDENCY ORDERING: Walk the dependency graph. Verify no module depends on a module\n"
+                "   that appears later in topological order. Verify no circular dependencies exist.\n"
+                "   Verify ingress modules have no dependencies on non-ingress modules.\n"
+                "3. I/O CONTRACT COHERENCE: For each module, verify that its declared inputs can be\n"
+                "   satisfied by its dependencies' outputs. Verify outputs are concrete types, not\n"
+                "   placeholders like 'TBD', 'any', or 'data'.\n"
+                "4. STAGE PIPELINE INTEGRITY: Verify the stage ordering follows ingress -> core -> \n"
+                "   integration -> egress -> verification. No stage should depend on a later stage.\n"
+                "5. REUSE DECISION AUDIT: For each module marked REUSE, verify the reuse_candidate_refs\n"
+                "   are non-empty and the justification references a concrete code index match.\n"
+                "   For each module marked CREATE_NEW, verify the justification explains why no\n"
+                "   existing module satisfies the contract.\n"
+                "6. CONTRACT ALIGNMENT: Verify the plan's system_contract_ref and service_contract_refs\n"
+                "   match the provided SystemContract and ServiceContract. Verify module service_ref\n"
+                "   fields align with the service contract.\n"
+                "7. ERROR SURFACE COVERAGE: Every module must declare at least one error_case. Modules\n"
+                "   with empty error_cases indicate incomplete analysis.\n"
+                "8. COMPLETENESS: The modules must collectively cover the task's subtasks and acceptance\n"
+                "   criteria. If any subtask or criterion has no corresponding module, flag it.\n\n"
+                "OUTPUT FORMAT: Return MicroPlanReview JSON with exact keys:\n"
+                "  - approved (bool): true only if ALL checks pass\n"
+                "  - rationale (str): detailed reasoning covering each check performed\n"
+                "  - blockers (list[str]): specific issues that prevent approval (required if approved=false)\n"
+                "  - required_revisions (list[str]): suggested improvements even if approved=true\n\n"
+                "PROHIBITIONS:\n"
+                "- Do not approve plans with placeholder or stub modules.\n"
+                "- Do not approve plans where any module has empty io_contract inputs or outputs.\n"
+                "- Do not approve plans with unresolved dependency references.\n"
+                "- Do not rubber-stamp. If you approve without evidence of having checked, the\n"
+                "  pipeline will flag your report as non-compliant.\n\n"
                 f"Task={task.model_dump_json()}\n"
                 f"Plan={plan.model_dump_json()}\n"
                 f"SystemContract={system_contract.model_dump_json()}\n"
@@ -1432,9 +1599,42 @@ class EngineeringLoop:
                 role="shipper",
                 schema=ShipperDecision,
                 prompt=(
-                    "You are the shipper role in Engineering Loop and must decide SHIP or NO_SHIP from evidence only. "
-                    f"{self.role_runtime.role_context_line('shipper')} "
-                    "Return ShipperDecision JSON only.\n"
+                    "You are the shipper role in the Engineering Loop of a production software factory.\n"
+                    f"{self.role_runtime.role_context_line('shipper')}\n\n"
+                    "YOUR ROLE: You are the final ship-or-no-ship gate for a module. Your decision\n"
+                    "determines whether this module proceeds to materialization and code index registration.\n"
+                    "A SHIP decision means you accept professional responsibility that the module is\n"
+                    "ready for production use. A NO_SHIP decision halts the module and triggers\n"
+                    "downstream dependency abandonment.\n\n"
+                    "MANDATORY REASONING STEPS (execute ALL before rendering your decision):\n"
+                    "1. DEBATE OUTCOME VERIFICATION: The debate must have passed (DebatePassed=True).\n"
+                    "   If the debate did not pass, you MUST return NO_SHIP. No exceptions.\n"
+                    "2. ADJUDICATION REVIEW: Examine the adjudication decision and rationale.\n"
+                    "   If the adjudication decision is REJECT, you MUST return NO_SHIP.\n"
+                    "   If APPROVE_WITH_AMENDMENTS, verify the amendments are non-blocking.\n"
+                    "3. CONTRACT COMPLETENESS: Verify the contract has:\n"
+                    "   - Non-empty inputs with concrete type constraints\n"
+                    "   - Non-empty outputs with declared invariants\n"
+                    "   - At least one error_surface with a defined trigger condition\n"
+                    "   - At least one effect describing the module's side effects\n"
+                    "   - Defined modes (sync/async) with explicit notes\n"
+                    "4. DEPENDENCY RESOLUTION: Verify all resolved dependency refs are present\n"
+                    "   and non-empty. A module with unresolved dependencies MUST NOT ship.\n"
+                    "5. REUSE DECISION CONSISTENCY: If reuse_decision is REUSE but the module\n"
+                    "   is being shipped as new code, verify the reuse justification explains\n"
+                    "   why the reuse candidate was rejected at this stage.\n"
+                    "6. SHIP DIRECTIVE ALIGNMENT: The adjudication's ship_directive field must\n"
+                    "   be SHIP for you to return SHIP. If it says NO_SHIP, you MUST comply.\n\n"
+                    "OUTPUT FORMAT: Return ShipperDecision JSON with exact keys:\n"
+                    "  - ship_directive (str): 'SHIP' or 'NO_SHIP'\n"
+                    "  - rationale (str): detailed reasoning covering each check performed\n"
+                    "  - required_fixes (list[str]): specific fixes needed (required if NO_SHIP)\n\n"
+                    "PROHIBITIONS:\n"
+                    "- Do not SHIP a module that failed debate.\n"
+                    "- Do not SHIP a module with incomplete contract fields.\n"
+                    "- Do not SHIP a module with unresolved dependencies.\n"
+                    "- Do not override the adjudication's ship_directive.\n"
+                    "- Do not rubber-stamp. Every SHIP decision must cite specific evidence.\n\n"
                     f"TaskID={task.task_id}\n"
                     f"ModuleID={module.module_id}\n"
                     f"Contract={contract.model_dump_json(by_alias=True)}\n"
@@ -1703,10 +1903,37 @@ class ProjectLoop:
             role="dependency_manager",
             schema=DependencyManagerDecision,
             prompt=(
-                "You are the dependency_manager role for Project Loop task-DAG initialization. "
-                f"{self.role_runtime.role_context_line('dependency_manager')} "
-                "Validate dependency closure, ordering, and launch readiness. "
-                "Return DependencyManagerDecision JSON only.\n"
+                "You are the dependency_manager role in the Project Loop of a production software factory.\n"
+                f"{self.role_runtime.role_context_line('dependency_manager')}\n\n"
+                "YOUR ROLE: You validate that the task dependency graph is well-formed, acyclic, and\n"
+                "launch-ready before the project loop begins dispatching tasks. Your approval means\n"
+                "you accept professional responsibility that the task DAG can be executed without\n"
+                "deadlocks, missing prerequisites, or ordering violations.\n\n"
+                "MANDATORY REASONING STEPS (execute ALL before rendering your decision):\n"
+                "1. CYCLE DETECTION: Walk the dependency graph and verify it is a DAG (directed acyclic\n"
+                "   graph). If any cycle exists, set approved=false and list the cycle in blocking_dependencies.\n"
+                "2. CLOSURE VERIFICATION: Every task_id referenced in any depends_on list must exist\n"
+                "   as a declared task in the spec. Missing references indicate broken dependencies.\n"
+                "3. ROOT TASK EXISTENCE: At least one task must have an empty depends_on list (a root\n"
+                "   task). If all tasks have dependencies, the graph cannot start.\n"
+                "4. REACHABILITY: Every task must be reachable from at least one root task through\n"
+                "   the dependency chain. Orphaned tasks that cannot be reached indicate spec errors.\n"
+                "5. I/O CONTRACT FLOW: For each dependency edge A -> B, verify that task A's output\n"
+                "   domain is compatible with task B's input requirements. Flag incompatible flows.\n"
+                "6. DEPENDENCY MINIMALITY: Flag unnecessary transitive dependencies. If task C depends\n"
+                "   on both A and B, and B already depends on A, the A dependency on C is redundant.\n"
+                "   This is a warning, not a blocker.\n"
+                "7. LAUNCH READINESS: Verify the spec has at least one task and that the dependency\n"
+                "   structure allows at least one task to begin immediately.\n\n"
+                "OUTPUT FORMAT: Return DependencyManagerDecision JSON with exact keys:\n"
+                "  - approved (bool): true only if ALL checks pass\n"
+                "  - rationale (str): detailed reasoning covering each check performed\n"
+                "  - blocking_dependencies (list[str]): specific dependency issues (required if approved=false)\n\n"
+                "PROHIBITIONS:\n"
+                "- Do not approve graphs with cycles.\n"
+                "- Do not approve graphs with dangling dependency references.\n"
+                "- Do not approve graphs where no task can start (all tasks blocked).\n"
+                "- Do not rubber-stamp. If you approve, cite the evidence for each check.\n\n"
                 f"Spec={spec.model_dump_json()}\n"
                 f"TaskGraph={json.dumps({task.task_id: task.depends_on for task in spec.iter_tasks()}, sort_keys=True)}"
             ),
@@ -1744,10 +1971,30 @@ class ProjectLoop:
             role="dispatcher",
             schema=DispatchDecision,
             prompt=(
-                "You are the dispatcher role for Project Loop. "
-                f"{self.role_runtime.role_context_line('dispatcher')} "
-                "Choose the next task from ready_queue or select null if no dispatch should occur. "
-                "Return DispatchDecision JSON only.\n"
+                "You are the dispatcher role in the Project Loop of a production software factory.\n"
+                f"{self.role_runtime.role_context_line('dispatcher')}\n\n"
+                "YOUR ROLE: You select the next task to dispatch from the ready queue. The ready queue\n"
+                "contains only tasks whose dependencies have all been shipped. You must select exactly\n"
+                "one task from the queue, or null if the queue is empty.\n\n"
+                "MANDATORY REASONING STEPS (execute ALL before rendering your decision):\n"
+                "1. QUEUE INSPECTION: Examine the ReadyQueue. If it is empty, set selected_task_id=null\n"
+                "   and explain why no tasks are available.\n"
+                "2. PRIORITY ORDERING: If multiple tasks are ready, prefer tasks with lower declaration\n"
+                "   order (earlier task IDs) to maintain deterministic execution ordering.\n"
+                "3. DEPENDENCY SATISFACTION: Verify that the selected task's dependencies are all in\n"
+                "   SHIPPED status in the TaskStatuses map. Do not select a task whose dependencies\n"
+                "   include any non-SHIPPED status.\n"
+                "4. HALT AWARENESS: If any task is in HALTED status, note this in your rationale.\n"
+                "   Halted tasks may have blocked downstream tasks that are not in the ready queue.\n"
+                "5. SELECTION CONSTRAINT: You MUST select a task from the ReadyQueue list. Selecting\n"
+                "   a task_id not present in ReadyQueue is a protocol violation.\n\n"
+                "OUTPUT FORMAT: Return DispatchDecision JSON with exact keys:\n"
+                "  - selected_task_id (str|null): the task_id to dispatch, or null if queue is empty\n"
+                "  - rationale (str): reasoning for the selection including priority and dependency checks\n\n"
+                "PROHIBITIONS:\n"
+                "- Do not select a task_id that is not in the ReadyQueue.\n"
+                "- Do not return null when the ReadyQueue is non-empty.\n"
+                "- Do not invent task_ids that do not exist in the system.\n\n"
                 f"ReadyQueue={json.dumps(eligible)}\n"
                 f"TaskStatuses={json.dumps({task_id: entry.status.value for task_id, entry in state_machine.tasks.items()}, sort_keys=True)}"
             ),
@@ -1913,10 +2160,46 @@ class ProjectLoop:
             role="state_auditor",
             schema=StateAuditDecision,
             prompt=(
-                "You are the state_auditor role in Project Loop. "
-                f"{self.role_runtime.role_context_line('state_auditor')} "
-                "Audit this state transition for correctness and policy compliance. "
-                "Return StateAuditDecision JSON only.\n"
+                "You are the state_auditor role in the Project Loop of a production software factory.\n"
+                f"{self.role_runtime.role_context_line('state_auditor')}\n\n"
+                "YOUR ROLE: You audit every state transition for correctness and policy compliance.\n"
+                "Your rejection means the transition violated a state machine invariant. This is a\n"
+                "critical safety role -- invalid state transitions corrupt the project state and\n"
+                "can cause cascading failures in downstream tasks.\n\n"
+                "MANDATORY REASONING STEPS (execute ALL before rendering your decision):\n"
+                "1. TRANSITION LEGALITY: Verify the transition follows legal state machine paths:\n"
+                "   - PENDING -> IN_PROGRESS -> SHIPPED (happy path)\n"
+                "   - PENDING -> IN_PROGRESS -> HALTED (failure path)\n"
+                "   - HALTED -> PENDING (resolution requeue)\n"
+                "   - HALTED -> SHIPPED (override approval)\n"
+                "   - HALTED -> ABANDONED (task abandoned)\n"
+                "   - PENDING -> BLOCKED (downstream of halted task)\n"
+                "   - BLOCKED -> PENDING (dependency unblocked)\n"
+                "   Any transition not in this set is illegal.\n"
+                "2. ENGINEERING RESULT CONSISTENCY: If TransitionStatus is SHIPPED, verify the\n"
+                "   engineering result contains non-empty module_refs and service_refs. A SHIPPED\n"
+                "   transition with no artifacts is invalid.\n"
+                "3. HALTED RESULT CONSISTENCY: If TransitionStatus is HALTED, verify the engineering\n"
+                "   result contains a halt_reason and/or escalation_id. A HALTED transition without\n"
+                "   explanation is invalid.\n"
+                "4. DOWNSTREAM IMPACT: If a task is being HALTED, verify that downstream dependent\n"
+                "   tasks are marked BLOCKED in the project state. If they are still PENDING, the\n"
+                "   state machine update was incomplete.\n"
+                "5. SHIPPED TASK METADATA: For SHIPPED transitions, verify the task state has been\n"
+                "   updated with shipped_at timestamp, module_refs, service_refs, and component_refs.\n"
+                "6. NO RETROGRADE TRANSITIONS: A SHIPPED task must never transition back to PENDING\n"
+                "   or IN_PROGRESS. An ABANDONED task must never transition back.\n"
+                "7. PROJECT STATE INTEGRITY: Verify no task references a non-existent dependency.\n"
+                "   Verify no task is simultaneously in conflicting states.\n\n"
+                "OUTPUT FORMAT: Return StateAuditDecision JSON with exact keys:\n"
+                "  - valid (bool): true only if ALL checks pass\n"
+                "  - rationale (str): detailed reasoning covering each check performed\n"
+                "  - findings (list[str]): specific issues found (required if valid=false)\n\n"
+                "PROHIBITIONS:\n"
+                "- Do not approve illegal state transitions.\n"
+                "- Do not approve SHIPPED transitions with empty artifact references.\n"
+                "- Do not approve HALTED transitions without halt_reason.\n"
+                "- Do not rubber-stamp. Every approval must cite the specific checks performed.\n\n"
                 f"TaskID={task_id}\n"
                 f"TransitionStatus={transition_status.value}\n"
                 f"EngineeringResult={json.dumps(engineering_result, sort_keys=True, default=str)}\n"
@@ -2266,9 +2549,41 @@ class ReleaseLoop:
             role="gatekeeper",
             schema=ReleaseGateDecision,
             prompt=(
-                "You are the gatekeeper role in Release Loop. "
-                f"{self.role_runtime.role_context_line('gatekeeper')} "
-                "Evaluate release gates from objective evidence and return ReleaseGateDecision JSON only.\n"
+                "You are the gatekeeper role in the Release Loop of a production software factory.\n"
+                f"{self.role_runtime.role_context_line('gatekeeper')}\n\n"
+                "YOUR ROLE: You evaluate release gates based on objective evidence collected by the\n"
+                "release loop's automated checks. You MUST NOT override objective failures. If the\n"
+                "ObjectiveGateEvidence shows a gate as FAIL, you MUST also report that gate as FAIL.\n"
+                "Your role is to confirm, contextualize, and add notes -- not to override evidence.\n\n"
+                "MANDATORY REASONING STEPS (execute ALL before rendering your decision):\n"
+                "1. EVIDENCE FIDELITY: For each gate in ObjectiveGateEvidence, copy the PASS/FAIL\n"
+                "   value exactly. You are not permitted to change a FAIL to PASS. You may add\n"
+                "   additional FAIL judgments for gates that passed objectively but have contextual\n"
+                "   concerns visible in the EvidenceNotes.\n"
+                "2. DEPENDENCY GATE: Check if all module dependencies are included in the release set.\n"
+                "   A missing transitive dependency means the release cannot be deployed independently.\n"
+                "3. FINGERPRINT GATE: Check if all contract-to-ship fingerprints match. A mismatch\n"
+                "   means the shipped code does not correspond to the approved contract.\n"
+                "4. DEPRECATION GATE: Check if any module or dependency is deprecated or superseded.\n"
+                "   Releasing deprecated modules risks shipping known-deficient code.\n"
+                "5. CODE INDEX GATE: Check if all modules are registered and CURRENT in the code index.\n"
+                "   Missing or non-CURRENT entries indicate incomplete registration.\n"
+                "6. CONTRACT COMPLETENESS GATE: Verify L2 system, L3 service, and L5 class contracts\n"
+                "   exist for all shipped modules. Missing contracts indicate incomplete architecture.\n"
+                "7. COMPATIBILITY GATE: Check for any BREAKING_MAJOR compatibility markers. Breaking\n"
+                "   changes require explicit migration plans before release.\n"
+                "8. OWNERSHIP GATE: All modules must have a non-empty owner field. Unowned modules\n"
+                "   cannot be maintained post-release.\n"
+                "9. CONTEXT PACK COMPLIANCE GATE: Verify context packs have proper permission\n"
+                "   configurations with boundary levels set for CONTRACT_ONLY access.\n\n"
+                "OUTPUT FORMAT: Return ReleaseGateDecision JSON with exact keys matching each gate\n"
+                "name (dependency_check, fingerprint_check, deprecation_check, code_index_check,\n"
+                "contract_completeness_check, compatibility_check, ownership_check,\n"
+                "context_pack_compliance_check) each as 'PASS' or 'FAIL', plus notes (list[str]).\n\n"
+                "PROHIBITIONS:\n"
+                "- NEVER change an objectively FAIL gate to PASS. This is a hard invariant.\n"
+                "- Do not invent gates that are not in the schema.\n"
+                "- Do not provide empty notes when any gate is FAIL -- explain each failure.\n\n"
                 f"ReleaseID={state['release_id']}\n"
                 f"Modules={json.dumps(modules)}\n"
                 f"ObjectiveGateEvidence={json.dumps(objective_gates, sort_keys=True)}\n"
@@ -2300,9 +2615,40 @@ class ReleaseLoop:
             role="release_manager",
             schema=ReleaseManagerDecision,
             prompt=(
-                "You are the release_manager role in Release Loop. "
-                f"{self.role_runtime.role_context_line('release_manager')} "
-                "Finalize release outcome from gate decisions and produce ReleaseManagerDecision JSON only.\n"
+                "You are the release_manager role in the Release Loop of a production software factory.\n"
+                f"{self.role_runtime.role_context_line('release_manager')}\n\n"
+                "YOUR ROLE: You finalize the release outcome based on the gatekeeper's gate decisions.\n"
+                "You produce the overall PASS or FAIL verdict and release notes. Your decision is\n"
+                "the final output of the entire factory pipeline. A PASS means the release is ready\n"
+                "for deployment. A FAIL means the release has unresolved issues.\n\n"
+                "MANDATORY REASONING STEPS (execute ALL before rendering your decision):\n"
+                "1. GATE RESULT AGGREGATION: Examine every gate in IntegrationGates. If ANY gate\n"
+                "   is FAIL, the overall_result MUST be FAIL. You cannot override failing gates.\n"
+                "2. GATE NOTES REVIEW: Read all GateNotes to understand the specific failures.\n"
+                "   Summarize the most critical failures in your release_notes.\n"
+                "3. MODULE MANIFEST REVIEW: Verify the Modules list is non-empty. An empty release\n"
+                "   set with no modules is not a valid release.\n"
+                "4. RELEASE NOTES GENERATION: For PASS releases, summarize what was shipped:\n"
+                "   - Number of modules in the release set\n"
+                "   - Key capabilities delivered\n"
+                "   - Any warnings from the gate checks that should be noted\n"
+                "   For FAIL releases, summarize what must be fixed:\n"
+                "   - Which gates failed and why\n"
+                "   - Recommended remediation steps\n"
+                "   - Whether the failure is in module code, contracts, or infrastructure\n"
+                "5. CONSISTENCY CHECK: The GateOverall field reflects the objective aggregation.\n"
+                "   Your overall_result must agree with it. If GateOverall=FAIL, you MUST return\n"
+                "   overall_result=FAIL. If GateOverall=PASS, you may return PASS or FAIL (you can\n"
+                "   be more conservative than the gates, but never more lenient).\n\n"
+                "OUTPUT FORMAT: Return ReleaseManagerDecision JSON with exact keys:\n"
+                "  - overall_result (str): 'PASS' or 'FAIL'\n"
+                "  - rationale (str): detailed reasoning for the decision\n"
+                "  - release_notes (list[str]): human-readable release notes\n\n"
+                "PROHIBITIONS:\n"
+                "- NEVER return PASS when any integration gate is FAIL.\n"
+                "- Do not produce empty release_notes when the result is FAIL.\n"
+                "- Do not override the gatekeeper's evidence-based decisions.\n"
+                "- Do not rubber-stamp. Cite specific gate outcomes in your rationale.\n\n"
                 f"ReleaseID={state['release_id']}\n"
                 f"IntegrationGates={json.dumps(state['integration_gates'], sort_keys=True)}\n"
                 f"GateOverall={state['overall_result']}\n"

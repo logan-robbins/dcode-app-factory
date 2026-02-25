@@ -1,1 +1,1 @@
-{"stage":"engineering_loop","role":"arbiter","model_tier":"efficient","temperature":0.0,"max_context_tokens":20000,"context_policy":"adjudication_only","allowed_context_sections":["proposal_artifact","challenge_artifact","pass_fail_rubric"]}
+{"stage":"engineering_loop","role":"arbiter","model_tier":"frontier","temperature":0.0,"max_context_tokens":32000,"context_policy":"adjudication_only","allowed_context_sections":["proposal_artifact","challenge_artifact","pass_fail_rubric","module_contract","service_contracts"]}
