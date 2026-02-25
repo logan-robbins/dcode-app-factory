@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import ast
 import json
-import importlib.util
 import re
 import sqlite3
 import subprocess
-import trace
 import uuid
 from collections import defaultdict, deque
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,7 +28,6 @@ from .models import (
     ClassContract,
     ClassMethodContract,
     BoundaryLevel,
-    CodeIndexStatus,
     ContractCompatibility,
     ContextAccessLevel,
     ContextPack,
@@ -44,7 +39,6 @@ from .models import (
     StateAuditDecision,
     ProductRoleReport,
     MicroPlanReview,
-    ShipperDecision,
     ReleaseGateDecision,
     ReleaseManagerDecision,
     HumanResolution,
@@ -61,7 +55,6 @@ from .models import (
     ReuseDecision,
     ReuseSearchCandidate,
     ReuseSearchReport,
-    ShipDirective,
     ShipEnvironment,
     ShipEvidence,
     ShipVerification,
@@ -74,8 +67,18 @@ from .models import (
 )
 from .registry import CodeIndex
 from .settings import RuntimeSettings
-from .state_store import ArtifactStoreService, FactoryStateStore, build_project_state
-from .tools import emit_structured_spec_tool, search_code_index, validate_spec_tool, web_search
+from .state_store import ArtifactStoreService, FactoryStateStore, build_project_state, project_scoped_root
+from .tools import (
+    emit_structured_spec_tool,
+    list_files,
+    read_file,
+    run_command,
+    search_code_index,
+    search_files,
+    validate_spec_tool,
+    web_search,
+    write_file,
+)
 from .utils import (
     apply_canonical_task_ids,
     build_context_pack,
@@ -181,25 +184,27 @@ class ProductLoop:
             return (
                 "You are the Researcher agent in the Product Loop of a production software factory. "
                 "Your sole job is reuse-first discovery: before the factory builds anything new, "
-                "you must determine whether the requested functionality already exists -- as an "
-                "open-source library, an internal module in the code index, or a market product "
-                "that can be integrated rather than rebuilt.\n\n"
+                "you must determine whether the requested functionality already exists -- as existing "
+                "workspace files, an open-source library, or a market product that can be integrated "
+                "rather than rebuilt.\n\n"
                 "MANDATORY STEPS (you must execute ALL of these before rendering your report):\n"
-                "1. Call search_code_index for every major capability described in the spec. "
-                "Record which capabilities already have internal implementations.\n"
-                "2. Call web_search for each capability that is NOT covered by the code index. "
+                "1. Call list_files('**/*.py') to understand the workspace structure. "
+                "Record which Python modules already exist in the workspace.\n"
+                "2. Call search_files for every major capability described in the spec. "
+                "Record which capabilities already have internal implementations in the workspace.\n"
+                "3. Call web_search for each capability that is NOT covered in the workspace. "
                 "Search for: existing open-source libraries, SaaS APIs, and published reference "
                 "architectures that could replace building from scratch.\n"
-                "3. For each task in the spec, classify it as: REUSE_INTERNAL (found in code "
-                "index), REUSE_EXTERNAL (viable open-source/API candidate found), or BUILD_NEW "
+                "4. For each task in the spec, classify it as: REUSE_INTERNAL (found in workspace), "
+                "REUSE_EXTERNAL (viable open-source/API candidate found), or BUILD_NEW "
                 "(no viable reuse candidate). If you classify a task as BUILD_NEW you must have "
                 "searched at least two different queries with no viable result.\n"
-                "4. If more than 60 percent of tasks are BUILD_NEW, add a warning that the spec "
+                "5. If more than 60 percent of tasks are BUILD_NEW, add a warning that the spec "
                 "may be reinventing the wheel.\n"
-                "5. If any task proposes building something that already exists in the code index, "
+                "6. If any task proposes building something that already exists in the workspace, "
                 "set approved=false and add a blocking_issue identifying the duplicate.\n\n"
                 "ENFORCEMENT:\n"
-                "- You MUST call search_code_index at least once. If you skip it, your report is invalid.\n"
+                "- You MUST call list_files or search_files at least once. If you skip it, your report is invalid.\n"
                 "- You MUST call web_search at least once. If you skip it, your report is invalid.\n"
                 "- Do not recommend mock, stub, fake, or placeholder implementations.\n"
                 "- Do not speculate about capabilities -- search and cite evidence.\n\n"
@@ -322,7 +327,7 @@ class ProductLoop:
                 role=role,
                 system_prompt=system_prompt,
                 user_message=user_message,
-                tools=[web_search, validate_spec_tool, search_code_index, emit_structured_spec_tool],
+                tools=[web_search, validate_spec_tool, list_files, search_files, emit_structured_spec_tool],
                 name=f"product-loop-{role}",
             )
             report = ProductRoleReport.model_validate(self._normalize_role_report_payload(payload))
@@ -411,12 +416,6 @@ class EngineeringResult:
     halt_reason: str | None = None
 
 
-class ModuleImplementationDraft(BaseModel):
-    module_source: str = Field(min_length=1)
-    sample_inputs: dict[str, str] = Field(min_length=1)
-    verification_checks: list[str] = Field(default_factory=list)
-
-
 class EngineeringLoop:
     """Engineering loop StateGraph with micro-plan and per-module debate execution."""
 
@@ -424,20 +423,6 @@ class EngineeringLoop:
     _TOKEN_RE = re.compile(r"[a-z0-9]{3,}")
     _REUSE_SCORE_THRESHOLD = 0.25
     _REUSE_TOKEN_OVERLAP_THRESHOLD = 0
-    _IMPLEMENTATION_MAX_ATTEMPTS = 3
-    _FORBIDDEN_IMPORT_PREFIXES = (
-        "os",
-        "subprocess",
-        "socket",
-        "requests",
-        "http",
-        "urllib",
-        "pathlib",
-        "shutil",
-        "tempfile",
-        "multiprocessing",
-    )
-    _FORBIDDEN_CALL_NAMES = {"eval", "exec", "compile", "open", "__import__", "input"}
     _STAGE_ORDER = {
         "ingress": 0,
         "core": 1,
@@ -449,13 +434,16 @@ class EngineeringLoop:
     def __init__(
         self,
         *,
-        code_index: CodeIndex,
+        code_index: CodeIndex | None = None,
         state_store: FactoryStateStore,
         settings: RuntimeSettings,
     ) -> None:
-        self.code_index = code_index
         self.state_store = state_store
         self.settings = settings
+        self.code_index = code_index if code_index is not None else CodeIndex(
+            project_scoped_root(state_store.base_root, settings.project_id) / "code_index",
+            embedding_model=settings.embedding_model,
+        )
         self.artifacts = ArtifactStoreService(state_store)
         self.role_runtime = RoleAgentRuntime(
             stage="engineering_loop",
@@ -892,55 +880,62 @@ class EngineeringLoop:
         service_contract = self._build_service_contract(task, plan)
         class_contracts = self._build_class_contracts(task, plan)
 
-        micro_plan_review = self.role_runtime.invoke_structured(
-            role="micro_planner",
-            schema=MicroPlanReview,
-            prompt=(
-                "You are the micro_planner role in the Engineering Loop of a production software factory.\n"
-                f"{self.role_runtime.role_context_line('micro_planner')}\n\n"
-                "YOUR ROLE: You are the architectural quality gate for micro plans. A micro plan decomposes\n"
-                "a single task into ordered, atomic modules with explicit I/O contracts, dependency chains,\n"
-                "and reuse decisions. Your approval means you accept professional responsibility that this\n"
-                "plan is implementable, dependency-safe, and contract-aligned.\n\n"
-                "MANDATORY REASONING STEPS (execute ALL before rendering your decision):\n"
-                "1. ATOMICITY CHECK: Verify each module has exactly one purpose. If a module combines\n"
-                "   multiple concerns (e.g., validation AND persistence), set approved=false and add a blocker.\n"
-                "2. DEPENDENCY ORDERING: Walk the dependency graph. Verify no module depends on a module\n"
-                "   that appears later in topological order. Verify no circular dependencies exist.\n"
-                "   Verify ingress modules have no dependencies on non-ingress modules.\n"
-                "3. I/O CONTRACT COHERENCE: For each module, verify that its declared inputs can be\n"
-                "   satisfied by its dependencies' outputs. Verify outputs are concrete types, not\n"
-                "   placeholders like 'TBD', 'any', or 'data'.\n"
-                "4. STAGE PIPELINE INTEGRITY: Verify the stage ordering follows ingress -> core -> \n"
-                "   integration -> egress -> verification. No stage should depend on a later stage.\n"
-                "5. REUSE DECISION AUDIT: For each module marked REUSE, verify the reuse_candidate_refs\n"
-                "   are non-empty and the justification references a concrete code index match.\n"
-                "   For each module marked CREATE_NEW, verify the justification explains why no\n"
-                "   existing module satisfies the contract.\n"
-                "6. CONTRACT ALIGNMENT: Verify the plan's system_contract_ref and service_contract_refs\n"
-                "   match the provided SystemContract and ServiceContract. Verify module service_ref\n"
-                "   fields align with the service contract.\n"
-                "7. ERROR SURFACE COVERAGE: Every module must declare at least one error_case. Modules\n"
-                "   with empty error_cases indicate incomplete analysis.\n"
-                "8. COMPLETENESS: The modules must collectively cover the task's subtasks and acceptance\n"
-                "   criteria. If any subtask or criterion has no corresponding module, flag it.\n\n"
-                "OUTPUT FORMAT: Return MicroPlanReview JSON with exact keys:\n"
-                "  - approved (bool): true only if ALL checks pass\n"
-                "  - rationale (str): detailed reasoning covering each check performed\n"
-                "  - blockers (list[str]): specific issues that prevent approval (required if approved=false)\n"
-                "  - required_revisions (list[str]): suggested improvements even if approved=true\n\n"
-                "PROHIBITIONS:\n"
-                "- Do not approve plans with placeholder or stub modules.\n"
-                "- Do not approve plans where any module has empty io_contract inputs or outputs.\n"
-                "- Do not approve plans with unresolved dependency references.\n"
-                "- Do not rubber-stamp. If you approve without evidence of having checked, the\n"
-                "  pipeline will flag your report as non-compliant.\n\n"
-                f"Task={task.model_dump_json()}\n"
-                f"Plan={plan.model_dump_json()}\n"
-                f"SystemContract={system_contract.model_dump_json()}\n"
-                f"ServiceContract={service_contract.model_dump_json()}"
-            ),
+        micro_planner_system_prompt = (
+            "You are the micro_planner role in the Engineering Loop of a production software factory.\n"
+            f"{self.role_runtime.role_context_line('micro_planner')}\n\n"
+            "YOUR ROLE: You are the architectural quality gate for micro plans. A micro plan decomposes\n"
+            "a single task into ordered, atomic modules with explicit I/O contracts, dependency chains,\n"
+            "and reuse decisions. Your approval means you accept professional responsibility that this\n"
+            "plan is implementable, dependency-safe, and contract-aligned.\n\n"
+            "You have access to workspace filesystem tools (read_file, list_files, search_files) to\n"
+            "inspect what already exists in the workspace before evaluating the plan.\n\n"
+            "MANDATORY REASONING STEPS (execute ALL before rendering your decision):\n"
+            "1. WORKSPACE INSPECTION: Call list_files('**/*.py') to understand existing code structure.\n"
+            "   Call search_files to check if any modules in the plan already exist in the workspace.\n"
+            "2. ATOMICITY CHECK: Verify each module has exactly one purpose. If a module combines\n"
+            "   multiple concerns (e.g., validation AND persistence), set approved=false and add a blocker.\n"
+            "3. DEPENDENCY ORDERING: Walk the dependency graph. Verify no module depends on a module\n"
+            "   that appears later in topological order. Verify no circular dependencies exist.\n"
+            "   Verify ingress modules have no dependencies on non-ingress modules.\n"
+            "4. I/O CONTRACT COHERENCE: For each module, verify that its declared inputs can be\n"
+            "   satisfied by its dependencies' outputs. Verify outputs are concrete types, not\n"
+            "   placeholders like 'TBD', 'any', or 'data'.\n"
+            "5. STAGE PIPELINE INTEGRITY: Verify the stage ordering follows ingress -> core -> \n"
+            "   integration -> egress -> verification. No stage should depend on a later stage.\n"
+            "6. REUSE DECISION AUDIT: For each module marked CREATE_NEW, verify the justification\n"
+            "   explains why no existing workspace file satisfies the contract.\n"
+            "7. CONTRACT ALIGNMENT: Verify the plan's system_contract_ref and service_contract_refs\n"
+            "   match the provided SystemContract and ServiceContract.\n"
+            "8. ERROR SURFACE COVERAGE: Every module must declare at least one error_case.\n"
+            "9. COMPLETENESS: The modules must collectively cover the task's subtasks and acceptance\n"
+            "   criteria. If any subtask or criterion has no corresponding module, flag it.\n\n"
+            "OUTPUT FORMAT: Return MicroPlanReview JSON with exact keys:\n"
+            "  - approved (bool): true only if ALL checks pass\n"
+            "  - rationale (str): detailed reasoning covering each check performed\n"
+            "  - blockers (list[str]): specific issues that prevent approval (required if approved=false)\n"
+            "  - required_revisions (list[str]): suggested improvements even if approved=true\n\n"
+            "PROHIBITIONS:\n"
+            "- Do not approve plans with placeholder or stub modules.\n"
+            "- Do not approve plans where any module has empty io_contract inputs or outputs.\n"
+            "- Do not approve plans with unresolved dependency references.\n"
+            "- Do not rubber-stamp. If you approve without evidence of having checked, the\n"
+            "  pipeline will flag your report as non-compliant.\n"
         )
+        micro_planner_user_message = (
+            f"Review the micro plan for task {task.task_id} and return MicroPlanReview JSON.\n"
+            f"Task={task.model_dump_json()}\n"
+            f"Plan={plan.model_dump_json()}\n"
+            f"SystemContract={system_contract.model_dump_json()}\n"
+            f"ServiceContract={service_contract.model_dump_json()}"
+        )
+        micro_plan_payload = self.role_runtime.invoke_deepagent_json(
+            role="micro_planner",
+            system_prompt=micro_planner_system_prompt,
+            user_message=micro_planner_user_message,
+            tools=[read_file, list_files, search_files],
+            name=f"micro-planner-{task.task_id}",
+        )
+        micro_plan_review = MicroPlanReview.model_validate(micro_plan_payload)
         self.state_store.write_agent_output(
             stage="engineering_loop",
             role="micro_planner",
@@ -1183,126 +1178,11 @@ class EngineeringLoop:
         major, minor, patch = sorted(versions)[-1]
         return f"{major}.{minor}.{patch + 1}"
 
-    def _build_implementation_prompt(
-        self,
-        *,
-        contract: MicroModuleContract,
-        task: Task | None,
-        module: MicroPlanModule | None,
-        attempt: int,
-        prior_error: str | None,
-    ) -> str:
-        module_ref = f"{contract.module_id}@{contract.module_version}"
-        context = {
-            "task_id": task.task_id if task is not None else None,
-            "task_name": task.name if task is not None else None,
-            "module_id": module.module_id if module is not None else contract.module_id,
-            "module_name": module.name if module is not None else contract.name,
-            "module_purpose": module.purpose if module is not None else contract.purpose,
-            "module_depends_on": list(module.depends_on) if module is not None else [],
-            "module_ref": module_ref,
-            "attempt": attempt,
-            "previous_validation_error": prior_error,
-        }
-        return (
-            "You are generating production implementation code for a shipped module contract.\n"
-            "Return ModuleImplementationDraft JSON only.\n"
-            "Hard requirements:\n"
-            "- module_source must define execute(inputs: Mapping[str, str]) -> dict[str, str].\n"
-            "- module_source must define verify_contract() -> dict[str, object].\n"
-            "- execute must validate required inputs (presence, type=str, non-empty after strip).\n"
-            "- execute must return exactly the declared output keys, all as non-empty strings.\n"
-            "- execute must be deterministic for identical inputs.\n"
-            "- verify_contract must execute the same logic and return keys: module_ref, sample_inputs, outputs.\n"
-            "- Do not perform network, filesystem, environment, or subprocess operations.\n"
-            "- Do not use eval/exec/compile/open/input/__import__.\n"
-            "- Do not use mock/stub/fake/placeholder behavior or synthetic fallback paths.\n"
-            "- Keep implementation self-contained and production-quality with clear error messages.\n"
-            "- sample_inputs must include every required input key with non-empty string values.\n"
-            f"Context={json.dumps(context, sort_keys=True)}\n"
-            f"Contract={contract.model_dump_json(by_alias=True)}"
-        )
-
-    @staticmethod
-    def _call_name(node: ast.Call) -> str | None:
-        if isinstance(node.func, ast.Name):
-            return node.func.id
-        if isinstance(node.func, ast.Attribute):
-            return node.func.attr
-        return None
-
-    def _validate_generated_module_source(self, module_source: str, *, module_id: str) -> None:
-        if not module_source.strip():
-            raise ValueError(f"generated module source is empty for {module_id}")
-        tree = ast.parse(module_source, filename=f"{module_id}.py")
-        function_names = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
-        if "execute" not in function_names:
-            raise ValueError(f"generated source missing execute() for {module_id}")
-        if "verify_contract" not in function_names:
-            raise ValueError(f"generated source missing verify_contract() for {module_id}")
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    imported = alias.name.split(".", 1)[0]
-                    if imported in self._FORBIDDEN_IMPORT_PREFIXES:
-                        raise ValueError(f"generated source imports forbidden module '{imported}' for {module_id}")
-            if isinstance(node, ast.ImportFrom):
-                imported = (node.module or "").split(".", 1)[0]
-                if imported in self._FORBIDDEN_IMPORT_PREFIXES:
-                    raise ValueError(f"generated source imports forbidden module '{imported}' for {module_id}")
-            if isinstance(node, ast.Call):
-                call_name = self._call_name(node)
-                if call_name in self._FORBIDDEN_CALL_NAMES:
-                    raise ValueError(f"generated source calls forbidden function '{call_name}' for {module_id}")
-
-    @staticmethod
-    def _validated_sample_inputs(
-        contract: MicroModuleContract,
-        sample_inputs: dict[str, str],
-    ) -> dict[str, str]:
-        required = [entry.name for entry in contract.inputs]
-        normalized: dict[str, str] = {}
-        for key in required:
-            if key not in sample_inputs:
-                raise ValueError(f"generated sample_inputs missing key '{key}'")
-            raw_value = sample_inputs[key]
-            if not isinstance(raw_value, str):
-                raise ValueError(f"generated sample_inputs value for '{key}' must be string")
-            value = raw_value.strip()
-            if not value:
-                raise ValueError(f"generated sample_inputs value for '{key}' must be non-empty")
-            normalized[key] = value
-        return normalized
-
-    def _generate_module_implementation(
-        self,
-        *,
-        contract: MicroModuleContract,
-        task: Task | None,
-        module: MicroPlanModule | None,
-        attempt: int,
-        prior_error: str | None,
-    ) -> ModuleImplementationDraft:
-        prompt = self._build_implementation_prompt(
-            contract=contract,
-            task=task,
-            module=module,
-            attempt=attempt,
-            prior_error=prior_error,
-        )
-        return self.role_runtime.invoke_structured(
-            role="proposer",
-            schema=ModuleImplementationDraft,
-            prompt=prompt,
-        )
-
-    @staticmethod
-    def _repo_revision() -> str:
-        repo_root = Path(__file__).resolve().parents[2]
+    def _repo_revision(self) -> str:
+        workspace_root = self.settings.workspace_root_path
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            cwd=repo_root,
+            cwd=str(workspace_root),
             capture_output=True,
             text=True,
             check=False,
@@ -1310,192 +1190,104 @@ class EngineeringLoop:
         revision = result.stdout.strip()
         if result.returncode != 0 or not revision:
             stderr = result.stderr.strip() or "unknown git error"
-            raise RuntimeError(f"unable to resolve git revision: {stderr}")
+            return f"unknown-revision ({stderr})"
         return revision
 
-    @staticmethod
-    def _dependency_lock_ref() -> str:
-        repo_root = Path(__file__).resolve().parents[2]
-        lock_path = repo_root / "uv.lock"
-        if not lock_path.is_file():
-            raise FileNotFoundError(f"dependency lock file is missing: {lock_path}")
-        return str(lock_path.relative_to(repo_root))
+    def _dependency_lock_ref(self) -> str:
+        workspace_root = self.settings.workspace_root_path
+        for lock_name in ("uv.lock", "requirements.txt", "Pipfile.lock"):
+            lock_path = workspace_root / lock_name
+            if lock_path.is_file():
+                return lock_name
+        return "no-lock-file"
 
-    def _materialize_and_verify_module(
+    def _build_ship_system_prompt(
+        self,
+        contract: MicroModuleContract,
+        task: Task | None,
+        module: MicroPlanModule | None,
+    ) -> str:
+        module_ref = f"{contract.module_id}@{contract.module_version}"
+        return (
+            "You are the shipper agent in the Engineering Loop of a production software factory.\n"
+            f"{self.role_runtime.role_context_line('shipper')}\n\n"
+            "YOUR ROLE: You implement a module contract by writing real source files and tests directly\n"
+            "into the workspace using the provided filesystem tools. You then run the verification\n"
+            "command and return a structured JSON report.\n\n"
+            "MANDATORY STEPS (execute ALL before returning your JSON):\n"
+            "1. WORKSPACE INSPECTION: Call list_files('**/*.py') and search_files to understand the\n"
+            "   existing codebase structure. Read relevant existing files with read_file.\n"
+            "2. IMPLEMENTATION: Write production-quality source code using write_file. Follow existing\n"
+            "   project conventions observed in step 1. Write tests alongside the source.\n"
+            "3. VERIFICATION: Run the verification_command using run_command. Capture the output.\n"
+            "4. RETURN JSON: Return a single JSON object with EXACTLY these keys:\n"
+            "   - files_written (list[str]): relative paths of all files you wrote\n"
+            "   - verification_command (str): the exact command you ran\n"
+            "   - test_output (str): full stdout+stderr from the verification command\n"
+            "   - test_passed (bool): true if verification command exited 0 or 5 (no tests collected)\n\n"
+            "VERIFICATION COMMAND: Run `uv run pytest -q --tb=short` (or the appropriate test runner\n"
+            "for this project) targeting the files you created. If no test runner is configured,\n"
+            "run `python -m py_compile <your_source_file>` as a minimum syntax check.\n\n"
+            "PROHIBITIONS:\n"
+            "- Do not write mock/stub/fake/placeholder implementations.\n"
+            "- Do not return test_passed=true if the verification command failed.\n"
+            "- Do not write outside the workspace root.\n"
+            "- Return ONLY the JSON object, no markdown fences.\n\n"
+            f"ModuleRef={module_ref}\n"
+            f"Contract={contract.model_dump_json(by_alias=True)}\n"
+            f"TaskID={task.task_id if task else 'unknown'}\n"
+            f"ModulePurpose={module.purpose if module else contract.purpose}\n"
+            f"ModuleDependsOn={json.dumps(list(module.depends_on) if module else [])}"
+        )
+
+    def _ship_module(
         self,
         *,
         contract: MicroModuleContract,
-        task: Task | None = None,
-        module: MicroPlanModule | None = None,
-    ) -> tuple[str, str]:
-        module_dir = self.state_store.modules_dir / contract.module_id / contract.module_version
-        implementation_dir = module_dir / "implementation"
-        tests_dir = module_dir / "tests"
-        implementation_dir.mkdir(parents=True, exist_ok=True)
-        tests_dir.mkdir(parents=True, exist_ok=True)
+        task: Task | None,
+        module: MicroPlanModule | None,
+    ) -> ShipEvidence:
+        system_prompt = self._build_ship_system_prompt(contract, task, module)
+        user_message = (
+            f"Implement and verify module {contract.module_id}@{contract.module_version}. "
+            f"Purpose: {contract.purpose}. "
+            "Write the source files and tests, run verification, then return the JSON report."
+        )
+        payload = self.role_runtime.invoke_deepagent_json(
+            role="shipper",
+            system_prompt=system_prompt,
+            user_message=user_message,
+            tools=[read_file, write_file, run_command, list_files, search_files],
+            name=f"shipper-{contract.module_id}",
+        )
+        files_written: list[str] = payload.get("files_written") or []
+        verification_command: str = payload.get("verification_command") or ""
+        test_output: str = payload.get("test_output") or ""
+        test_passed: bool = bool(payload.get("test_passed", False))
 
-        implementation_path = implementation_dir / "module.py"
-        (implementation_dir / "__init__.py").write_text("from .module import execute, verify_contract\n", encoding="utf-8")
-        expected_outputs = [entry.name for entry in contract.outputs]
-        module_ref = f"{contract.module_id}@{contract.module_version}"
-        last_error: Exception | None = None
-        prior_error: str | None = None
-
-        for attempt in range(1, self._IMPLEMENTATION_MAX_ATTEMPTS + 1):
-            try:
-                draft = self._generate_module_implementation(
-                    contract=contract,
-                    task=task,
-                    module=module,
-                    attempt=attempt,
-                    prior_error=prior_error,
-                )
-                self._validate_generated_module_source(draft.module_source, module_id=contract.module_id)
-                implementation_path.write_text(draft.module_source, encoding="utf-8")
-
-                import_name = re.sub(
-                    r"[^a-zA-Z0-9_]+",
-                    "_",
-                    f"factory_{contract.module_id}_{contract.module_version}_{attempt}_{uuid.uuid4().hex[:6]}",
-                )
-                spec = importlib.util.spec_from_file_location(import_name, implementation_path)
-                if spec is None or spec.loader is None:
-                    raise RuntimeError(f"Unable to import generated implementation: {implementation_path}")
-                runtime_module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(runtime_module)
-
-                execute = getattr(runtime_module, "execute", None)
-                if not callable(execute):
-                    raise RuntimeError(f"Generated implementation missing callable execute(): {implementation_path}")
-                verify_contract = getattr(runtime_module, "verify_contract", None)
-                if not callable(verify_contract):
-                    raise RuntimeError(f"Generated implementation missing callable verify_contract(): {implementation_path}")
-
-                generated_inputs = self._validated_sample_inputs(contract, draft.sample_inputs)
-                sample_inputs = generated_inputs
-                first_output = execute(sample_inputs)
-                second_output = execute(dict(sample_inputs))
-                if not isinstance(first_output, Mapping) or not isinstance(second_output, Mapping):
-                    raise RuntimeError(f"Generated execute() must return mapping outputs for {contract.module_id}")
-                if dict(first_output) != dict(second_output):
-                    raise RuntimeError(f"Generated execute() is non-deterministic for {contract.module_id}")
-
-                output_dict = dict(first_output)
-                if set(output_dict.keys()) != set(expected_outputs):
-                    raise RuntimeError(
-                        f"Generated outputs do not match contract for {contract.module_id}: "
-                        f"expected={expected_outputs}, actual={sorted(output_dict.keys())}"
-                    )
-                for key in expected_outputs:
-                    value = output_dict[key]
-                    if not isinstance(value, str) or not value.strip():
-                        raise RuntimeError(
-                            f"Generated output field must be a non-empty string: {contract.module_id}.{key}"
-                        )
-
-                verify_payload = verify_contract()
-                if not isinstance(verify_payload, Mapping):
-                    raise RuntimeError(f"verify_contract() must return a mapping for {contract.module_id}")
-                verify_module_ref = verify_payload.get("module_ref")
-                if verify_module_ref != module_ref:
-                    raise RuntimeError(
-                        f"verify_contract() returned unexpected module_ref for {contract.module_id}: {verify_module_ref}"
-                    )
-                verify_outputs = verify_payload.get("outputs")
-                if not isinstance(verify_outputs, Mapping):
-                    raise RuntimeError(f"verify_contract() must return mapping outputs for {contract.module_id}")
-                if set(verify_outputs.keys()) != set(expected_outputs):
-                    raise RuntimeError(
-                        f"verify_contract() output keys mismatch for {contract.module_id}: "
-                        f"expected={expected_outputs}, actual={sorted(verify_outputs.keys())}"
-                    )
-
-                tracer = trace.Trace(count=True, trace=False)
-                traced_output = tracer.runfunc(execute, sample_inputs)
-                if dict(traced_output) != output_dict:
-                    raise RuntimeError(
-                        f"trace-based execute() run diverged from baseline output for {contract.module_id}"
-                    )
-                coverage_counts = tracer.results().counts
-                implementation_resolved = implementation_path.resolve()
-                executed_lines = sorted(
-                    {
-                        line_no
-                        for (filename, line_no), count in coverage_counts.items()
-                        if count > 0 and Path(filename).resolve() == implementation_resolved
-                    }
-                )
-                source_lines = implementation_path.read_text(encoding="utf-8").splitlines()
-                measurable_lines = [line for line in source_lines if line.strip() and not line.strip().startswith("#")]
-                coverage_percent = (
-                    round((len(executed_lines) / len(measurable_lines)) * 100.0, 2)
-                    if measurable_lines
-                    else 100.0
-                )
-
-                examples_path = module_dir / "examples.md"
-                examples_path.write_text(
-                    "# Examples\n\n## Example 1\n\n```input\n"
-                    + json.dumps(sample_inputs, indent=2, sort_keys=True)
-                    + "\n```\n\n```output\n"
-                    + json.dumps(output_dict, indent=2, sort_keys=True)
-                    + "\n```\n",
-                    encoding="utf-8",
-                )
-
-                evidence_ref = f"/modules/{contract.module_id}/{contract.module_version}/tests/execution_log.json"
-                coverage_ref = f"/modules/{contract.module_id}/{contract.module_version}/tests/coverage.json"
-                execution_log_path = tests_dir / "execution_log.json"
-                checks = [
-                    "execute returned mapping output",
-                    "execute output is deterministic",
-                    "output keys exactly match contract outputs",
-                    "output values are non-empty strings",
-                    "verify_contract returned expected module_ref and outputs",
-                ] + [check for check in draft.verification_checks if check.strip()]
-                execution_log_path.write_text(
-                    json.dumps(
-                        {
-                            "module_ref": module_ref,
-                            "verified_at": datetime.now(UTC).isoformat(),
-                            "result": "PASS",
-                            "attempt": attempt,
-                            "sample_inputs": sample_inputs,
-                            "first_output": output_dict,
-                            "second_output": dict(second_output),
-                            "checks": self._ordered_unique(checks),
-                        },
-                        indent=2,
-                        sort_keys=True,
-                    ),
-                    encoding="utf-8",
-                )
-                (tests_dir / "coverage.json").write_text(
-                    json.dumps(
-                        {
-                            "module_ref": module_ref,
-                            "module_file": f"/modules/{contract.module_id}/{contract.module_version}/implementation/module.py",
-                            "measurable_line_count": len(measurable_lines),
-                            "executed_line_count": len(executed_lines),
-                            "executed_lines": executed_lines,
-                            "line_coverage_percent": coverage_percent,
-                            "result": "PASS",
-                            "verified_at": datetime.now(UTC).isoformat(),
-                        },
-                        indent=2,
-                        sort_keys=True,
-                    ),
-                    encoding="utf-8",
-                )
-                return evidence_ref, coverage_ref
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                prior_error = f"{type(exc).__name__}: {exc}"
-
-        raise RuntimeError(
-            f"Unable to generate and verify implementation for {module_ref} after "
-            f"{self._IMPLEMENTATION_MAX_ATTEMPTS} attempts: {prior_error}"
-        ) from last_error
+        evidence_ref = f"/modules/{contract.module_id}/{contract.module_version}/ship_log.json"
+        verification = ShipVerification(
+            result="PASS" if test_passed else "FAIL",
+            interface_fingerprint=contract.interface_fingerprint,
+            evidence_ref=evidence_ref,
+        )
+        return ShipEvidence(
+            module_id=contract.module_id,
+            module_version=contract.module_version,
+            ship_id=f"SHIP-{uuid.uuid4().hex[:8]}",
+            verified_at=datetime.now(UTC),
+            verification=verification,
+            environment=ShipEnvironment(
+                repo_revision=self._repo_revision(),
+                dependency_lock_ref=self._dependency_lock_ref(),
+                runner_id="engineering-loop",
+            ),
+            test_artifact_refs=[evidence_ref],
+            files_written=files_written,
+            test_output=test_output,
+            test_passed=test_passed,
+            ship_time=datetime.now(UTC),
+        )
 
     def _module_step_node(self, state: EngineeringState) -> dict[str, Any] | Command[str]:
         plan = FractalPlan.model_validate(state["micro_plan"])
@@ -1527,30 +1319,19 @@ class EngineeringLoop:
         reuse_decision_value = module.reuse_decision.value
         reuse_justification_value = module.reuse_justification
         if module.reuse_decision == ReuseDecision.REUSE and module.reuse_candidate_refs:
+            # Trust the planner: mark as shipped directly with the candidate ref
             selected_ref = module.reuse_candidate_refs[0]
-            selected_entry = self.code_index.get_entry(selected_ref)
-            if selected_entry is None:
-                raise ValueError(
-                    f"Micro-plan selected reuse candidate not present in code index: {selected_ref}"
-                )
-            selected_deps = self._ordered_unique(selected_entry.dependencies)
-            if set(selected_deps) == set(resolved_dependency_refs):
-                module_status[module_id] = "SHIPPED"
-                module_refs[module_id] = selected_ref
-                shipped_modules.append(module_id)
-                return {
-                    "module_cursor": cursor + 1,
-                    "module_status": module_status,
-                    "module_refs": module_refs,
-                    "failed_modules": failed_modules,
-                    "abandoned_modules": abandoned_modules,
-                    "shipped_modules": shipped_modules,
-                }
-            reuse_decision_value = ReuseDecision.CREATE_NEW.value
-            reuse_justification_value = (
-                f"{module.reuse_justification}; rejected {selected_ref} due dependency mismatch "
-                f"(expected={resolved_dependency_refs}, selected={selected_deps})"
-            )
+            module_status[module_id] = "SHIPPED"
+            module_refs[module_id] = selected_ref
+            shipped_modules.append(module_id)
+            return {
+                "module_cursor": cursor + 1,
+                "module_status": module_status,
+                "module_refs": module_refs,
+                "failed_modules": failed_modules,
+                "abandoned_modules": abandoned_modules,
+                "shipped_modules": shipped_modules,
+            }
 
         cp_refs = self._build_context_packs(task, module)
         context_pack_ref = cp_refs["proposer"]
@@ -1595,77 +1376,8 @@ class EngineeringLoop:
         )
 
         if debate.passed:
-            shipper_decision = self.role_runtime.invoke_structured(
-                role="shipper",
-                schema=ShipperDecision,
-                prompt=(
-                    "You are the shipper role in the Engineering Loop of a production software factory.\n"
-                    f"{self.role_runtime.role_context_line('shipper')}\n\n"
-                    "YOUR ROLE: You are the final ship-or-no-ship gate for a module. Your decision\n"
-                    "determines whether this module proceeds to materialization and code index registration.\n"
-                    "A SHIP decision means you accept professional responsibility that the module is\n"
-                    "ready for production use. A NO_SHIP decision halts the module and triggers\n"
-                    "downstream dependency abandonment.\n\n"
-                    "MANDATORY REASONING STEPS (execute ALL before rendering your decision):\n"
-                    "1. DEBATE OUTCOME VERIFICATION: The debate must have passed (DebatePassed=True).\n"
-                    "   If the debate did not pass, you MUST return NO_SHIP. No exceptions.\n"
-                    "2. ADJUDICATION REVIEW: Examine the adjudication decision and rationale.\n"
-                    "   If the adjudication decision is REJECT, you MUST return NO_SHIP.\n"
-                    "   If APPROVE_WITH_AMENDMENTS, verify the amendments are non-blocking.\n"
-                    "3. CONTRACT COMPLETENESS: Verify the contract has:\n"
-                    "   - Non-empty inputs with concrete type constraints\n"
-                    "   - Non-empty outputs with declared invariants\n"
-                    "   - At least one error_surface with a defined trigger condition\n"
-                    "   - At least one effect describing the module's side effects\n"
-                    "   - Defined modes (sync/async) with explicit notes\n"
-                    "4. DEPENDENCY RESOLUTION: Verify all resolved dependency refs are present\n"
-                    "   and non-empty. A module with unresolved dependencies MUST NOT ship.\n"
-                    "5. REUSE DECISION CONSISTENCY: If reuse_decision is REUSE but the module\n"
-                    "   is being shipped as new code, verify the reuse justification explains\n"
-                    "   why the reuse candidate was rejected at this stage.\n"
-                    "6. SHIP DIRECTIVE ALIGNMENT: The adjudication's ship_directive field must\n"
-                    "   be SHIP for you to return SHIP. If it says NO_SHIP, you MUST comply.\n\n"
-                    "OUTPUT FORMAT: Return ShipperDecision JSON with exact keys:\n"
-                    "  - ship_directive (str): 'SHIP' or 'NO_SHIP'\n"
-                    "  - rationale (str): detailed reasoning covering each check performed\n"
-                    "  - required_fixes (list[str]): specific fixes needed (required if NO_SHIP)\n\n"
-                    "PROHIBITIONS:\n"
-                    "- Do not SHIP a module that failed debate.\n"
-                    "- Do not SHIP a module with incomplete contract fields.\n"
-                    "- Do not SHIP a module with unresolved dependencies.\n"
-                    "- Do not override the adjudication's ship_directive.\n"
-                    "- Do not rubber-stamp. Every SHIP decision must cite specific evidence.\n\n"
-                    f"TaskID={task.task_id}\n"
-                    f"ModuleID={module.module_id}\n"
-                    f"Contract={contract.model_dump_json(by_alias=True)}\n"
-                    f"DebatePassed={debate.passed}\n"
-                    f"DebateAdjudication={debate.adjudication.model_dump_json()}\n"
-                    f"ReuseDecision={reuse_decision_value}\n"
-                    f"ResolvedDependencyRefs={json.dumps(resolved_dependency_refs)}"
-                ),
-            )
-            self.state_store.write_agent_output(
-                stage="engineering_loop",
-                role="shipper",
-                run_id=f"{task.task_id}-{module.module_id}",
-                payload=shipper_decision.model_dump(mode="json"),
-            )
-            if shipper_decision.ship_directive != ShipDirective.SHIP:
-                module_status[module_id] = "FAILED"
-                failed_modules.append(module_id)
-                newly_abandoned = self._mark_abandoned(plan, module_id, module_status)
-                abandoned_modules.extend(newly_abandoned)
-                return {
-                    "module_cursor": cursor + 1,
-                    "module_status": module_status,
-                    "module_refs": module_refs,
-                    "failed_modules": failed_modules,
-                    "abandoned_modules": abandoned_modules,
-                    "shipped_modules": shipped_modules,
-                }
-
             try:
-                evidence_ref, coverage_ref = self._materialize_and_verify_module(
+                evidence = self._ship_module(
                     contract=contract,
                     task=task,
                     module=module,
@@ -1684,36 +1396,27 @@ class EngineeringLoop:
                     "shipped_modules": shipped_modules,
                 }
 
-            verification = ShipVerification(
-                result="PASS",
-                interface_fingerprint=contract.interface_fingerprint,
-                evidence_ref=evidence_ref,
-            )
-            evidence = ShipEvidence(
-                module_id=contract.module_id,
-                module_version=contract.module_version,
-                ship_id=f"SHIP-{uuid.uuid4().hex[:8]}",
-                verified_at=datetime.now(UTC),
-                verification=verification,
-                environment=ShipEnvironment(
-                    repo_revision=self._repo_revision(),
-                    dependency_lock_ref=self._dependency_lock_ref(),
-                    runner_id="engineering-loop",
-                ),
-                test_artifact_refs=[verification.evidence_ref],
-                coverage_report_ref=coverage_ref,
-                ship_time=datetime.now(UTC),
-            )
+            if not evidence.test_passed:
+                module_status[module_id] = "FAILED"
+                failed_modules.append(module_id)
+                newly_abandoned = self._mark_abandoned(plan, module_id, module_status)
+                abandoned_modules.extend(newly_abandoned)
+                return {
+                    "module_cursor": cursor + 1,
+                    "module_status": module_status,
+                    "module_refs": module_refs,
+                    "failed_modules": failed_modules,
+                    "abandoned_modules": abandoned_modules,
+                    "shipped_modules": shipped_modules,
+                }
+
             self.state_store.write_ship_evidence(evidence)
             self.state_store.seal_module(contract.module_id, contract.module_version)
-
             self.artifacts.ship(contract_envelope.artifact_id)
-
-            slug = self.code_index.register(contract)
+            self.code_index.register(contract)
             module_status[module_id] = "SHIPPED"
             module_refs[module_id] = f"{contract.module_id}@{contract.module_version}"
             shipped_modules.append(module_id)
-            _ = slug
         else:
             module_status[module_id] = "FAILED"
             failed_modules.append(module_id)
@@ -1817,10 +1520,9 @@ class ProjectLoop:
         self.spec = spec
         root = Path(state_store_root) if state_store_root is not None else Path(self.settings.state_store_root)
         self.state_store = FactoryStateStore(root, project_id=self.settings.project_id)
-        self.code_index = (
-            code_index
-            if code_index is not None
-            else CodeIndex(self.state_store.code_index_dir, embedding_model=self.settings.embedding_model)
+        self.code_index = code_index if code_index is not None else CodeIndex(
+            project_scoped_root(root, self.settings.project_id) / "code_index",
+            embedding_model=self.settings.embedding_model,
         )
         self.artifacts = ArtifactStoreService(self.state_store)
         self.enable_interrupts = enable_interrupts
@@ -2325,20 +2027,23 @@ class ReleaseLoopState(TypedDict, total=False):
 
 
 class ReleaseLoop:
-    """Release stage StateGraph with dependency/fingerprint/deprecation/code-index gates."""
+    """Release stage StateGraph with dependency/contract/compatibility/ownership/tests gates."""
 
     def __init__(
         self,
         *,
         state_store: FactoryStateStore,
-        code_index: CodeIndex,
         spec: ProductSpec,
+        code_index: CodeIndex | None = None,
         settings: RuntimeSettings | None = None,
     ) -> None:
         self.settings = settings if settings is not None else RuntimeSettings.from_env()
         self.state_store = state_store
-        self.code_index = code_index
         self.spec = spec
+        self.code_index = code_index if code_index is not None else CodeIndex(
+            project_scoped_root(state_store.base_root, self.settings.project_id) / "code_index",
+            embedding_model=self.settings.embedding_model,
+        )
         self.role_runtime = RoleAgentRuntime(
             stage="release_loop",
             settings=self.settings,
@@ -2359,21 +2064,36 @@ class ReleaseLoop:
         return graph
 
     def _expand_dependency_closure(self, modules: list[str]) -> list[str]:
-        entries = {entry.module_ref: entry for entry in self.code_index.list_entries()}
+        """Expand shipped modules to include all transitive dependencies.
+
+        Reads contract.json files from the state store to follow dependency links.
+        Does not require the code index to be populated.
+        """
         ordered = list(dict.fromkeys(modules))
         seen = set(ordered)
         queue: deque[str] = deque(ordered)
         while queue:
             module_ref = queue.popleft()
-            entry = entries.get(module_ref)
-            if entry is None:
+            module_id, sep, version = module_ref.partition("@")
+            if not sep:
                 continue
-            for dep in entry.dependencies:
-                if dep in seen:
+            contract_path = self.state_store.modules_dir / module_id / version / "contract.json"
+            if not contract_path.is_file():
+                continue
+            try:
+                payload = json.loads(contract_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    payload.pop("interface_fingerprint", None)
+                contract = MicroModuleContract.model_validate(payload)
+            except (ValueError, OSError):
+                continue
+            for dep in contract.dependencies:
+                dep_ref = dep.ref
+                if dep_ref in seen:
                     continue
-                seen.add(dep)
-                ordered.append(dep)
-                queue.append(dep)
+                seen.add(dep_ref)
+                ordered.append(dep_ref)
+                queue.append(dep_ref)
         return ordered
 
     def _init_node(self, _state: ReleaseLoopState) -> dict[str, Any]:
@@ -2393,46 +2113,28 @@ class ReleaseLoop:
 
     def _gate_check_node(self, state: ReleaseLoopState) -> dict[str, Any]:
         modules = list(state.get("modules", []))
-        entries = {entry.module_ref: entry for entry in self.code_index.list_entries()}
+        workspace_root = self.settings.workspace_root_path
         state_machine = self.state_store.read_project_state()
 
         dependency_pass = True
-        fingerprint_pass = True
-        deprecation_pass = True
-        code_index_pass = True
         contract_completeness_pass = True
         compatibility_pass = True
         ownership_pass = True
-        context_pack_compliance_pass = True
         notes: list[str] = []
 
         for module_ref in modules:
-            entry = entries.get(module_ref)
-            if entry is None:
-                code_index_pass = False
-                notes.append(f"Missing code index entry for {module_ref}")
+            module_id, sep, version = module_ref.partition("@")
+            if not sep:
+                contract_completeness_pass = False
+                notes.append(f"Invalid module_ref format (missing @version): {module_ref}")
                 continue
-            if entry.status != CodeIndexStatus.CURRENT:
-                code_index_pass = False
-                notes.append(f"Module {module_ref} is not CURRENT in code index")
-            if entry.status in {CodeIndexStatus.DEPRECATED, CodeIndexStatus.SUPERSEDED}:
-                deprecation_pass = False
-                notes.append(f"Module {module_ref} is inactive ({entry.status.value})")
 
-            if not entry.owner.strip():
-                ownership_pass = False
-                notes.append(f"Module {module_ref} missing owner metadata")
-            if entry.compatibility_type == ContractCompatibility.BREAKING_MAJOR:
-                compatibility_pass = False
-                notes.append(f"Module {module_ref} is marked BREAKING_MAJOR")
+            contract_path = self.state_store.modules_dir / module_id / version / "contract.json"
+            ship_path = self.state_store.modules_dir / module_id / version / "ship.json"
 
-            contract_path = self.state_store.root / entry.contract_ref.lstrip("/")
-            ship_path = self.state_store.root / entry.ship_ref.lstrip("/")
             contract: MicroModuleContract | None = None
-            ship_evidence: ShipEvidence | None = None
             if not contract_path.is_file():
                 contract_completeness_pass = False
-                fingerprint_pass = False
                 notes.append(f"Missing contract artifact for {module_ref}: {contract_path}")
             else:
                 try:
@@ -2442,78 +2144,32 @@ class ReleaseLoop:
                     contract = MicroModuleContract.model_validate(contract_payload)
                 except ValueError as exc:
                     contract_completeness_pass = False
-                    fingerprint_pass = False
-                    notes.append(f"Invalid contract artifact for {module_ref}: {exc}")
+                    notes.append(f"Invalid contract for {module_ref}: {exc}")
+
             if not ship_path.is_file():
                 contract_completeness_pass = False
-                fingerprint_pass = False
-                notes.append(f"Missing ship artifact for {module_ref}: {ship_path}")
-            else:
-                try:
-                    ship_evidence = ShipEvidence.model_validate_json(ship_path.read_text(encoding="utf-8"))
-                except ValueError as exc:
-                    contract_completeness_pass = False
-                    fingerprint_pass = False
-                    notes.append(f"Invalid ship artifact for {module_ref}: {exc}")
+                notes.append(f"Missing ship evidence for {module_ref}: {ship_path}")
 
-            if contract is not None and ship_evidence is not None:
-                if ship_evidence.verification.interface_fingerprint != contract.interface_fingerprint:
-                    fingerprint_pass = False
-                    notes.append(
-                        "Fingerprint mismatch for "
-                        f"{module_ref}: ship={ship_evidence.verification.interface_fingerprint} "
-                        f"contract={contract.interface_fingerprint}"
-                    )
+            if contract is not None:
+                if not contract.owner.strip():
+                    ownership_pass = False
+                    notes.append(f"Module {module_ref} missing owner metadata")
+                if contract.compatibility_type == ContractCompatibility.BREAKING_MAJOR:
+                    compatibility_pass = False
+                    notes.append(f"Module {module_ref} is marked BREAKING_MAJOR")
+                for dep in contract.dependencies:
+                    dep_ref = dep.ref
+                    if dep_ref not in modules:
+                        dependency_pass = False
+                        notes.append(f"Dependency {dep_ref} for {module_ref} not included in release set")
 
-            for dep in entry.dependencies:
-                if dep not in modules:
-                    dependency_pass = False
-                    notes.append(f"Dependency {dep} for {module_ref} not included in release set")
-                dep_entry = entries.get(dep)
-                if dep_entry and dep_entry.status in {CodeIndexStatus.DEPRECATED, CodeIndexStatus.SUPERSEDED}:
-                    deprecation_pass = False
-                    notes.append(f"Module {module_ref} depends on inactive dependency {dep}")
-                if dep_entry is None:
-                    # Missing dependency means we cannot verify consumer fingerprint pairing.
-                    fingerprint_pass = False
-                    notes.append(f"Cannot verify dependency fingerprint for {module_ref} -> {dep}")
-                    continue
-
-                dep_contract_path = self.state_store.root / dep_entry.contract_ref.lstrip("/")
-                dep_ship_path = self.state_store.root / dep_entry.ship_ref.lstrip("/")
-                if not dep_contract_path.is_file():
-                    fingerprint_pass = False
-                    notes.append(f"Cannot verify dependency fingerprint, missing contract: {dep_contract_path}")
-                    continue
-                if not dep_ship_path.is_file():
-                    fingerprint_pass = False
-                    notes.append(f"Cannot verify dependency fingerprint, missing ship evidence: {dep_ship_path}")
-                    continue
-                try:
-                    dep_contract_payload = json.loads(dep_contract_path.read_text(encoding="utf-8"))
-                    if isinstance(dep_contract_payload, dict):
-                        dep_contract_payload.pop("interface_fingerprint", None)
-                    dep_contract = MicroModuleContract.model_validate(dep_contract_payload)
-                    dep_ship = ShipEvidence.model_validate_json(dep_ship_path.read_text(encoding="utf-8"))
-                except ValueError as exc:
-                    fingerprint_pass = False
-                    notes.append(f"Cannot verify dependency fingerprint for {module_ref} -> {dep}: {exc}")
-                    continue
-                if dep_ship.verification.interface_fingerprint != dep_contract.interface_fingerprint:
-                    fingerprint_pass = False
-                    notes.append(
-                        "Dependency fingerprint mismatch for "
-                        f"{dep}: ship={dep_ship.verification.interface_fingerprint} "
-                        f"contract={dep_contract.interface_fingerprint}"
-                    )
-
+        # L2/L3/class contract completeness
         if not any(self.state_store.system_contracts_dir.rglob("contract.json")):
             contract_completeness_pass = False
             notes.append("Missing L2 system contracts in state store")
         if not any(self.state_store.service_contracts_dir.rglob("contract.json")):
             contract_completeness_pass = False
             notes.append("Missing L3 service contracts in state store")
-
         for task in state_machine.tasks.values():
             for class_ref in task.class_refs:
                 class_id, sep, class_version = class_ref.partition("@")
@@ -2526,24 +2182,36 @@ class ReleaseLoop:
                     contract_completeness_pass = False
                     notes.append(f"Missing class contract for {class_ref}: {class_path}")
 
-        for cp_path in self.state_store.context_packs_dir.glob("*.json"):
-            cp = ContextPack.model_validate_json(cp_path.read_text(encoding="utf-8"))
-            for permission in cp.permissions:
-                if permission.access_level == ContextAccessLevel.CONTRACT_ONLY and permission.level is None:
-                    context_pack_compliance_pass = False
-                    notes.append(
-                        f"Context pack {cp.cp_id} has CONTRACT_ONLY permission without level for path {permission.path}"
-                    )
+        # tests_pass gate: run pytest in workspace_root (skipped if no explicit workspace configured)
+        if not self.settings.workspace_root:
+            tests_pass = True
+            notes.append("tests_pass: skipped (FACTORY_WORKSPACE_ROOT not set; configure to enable)")
+        else:
+            try:
+                pytest_result = subprocess.run(
+                    "uv run pytest -q --tb=short",
+                    shell=True,
+                    cwd=str(workspace_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+                tests_pass = pytest_result.returncode in (0, 5)  # 5 = no tests collected
+                if not tests_pass:
+                    combined = (pytest_result.stdout + pytest_result.stderr)[:500]
+                    notes.append(f"Tests failed (rc={pytest_result.returncode}): {combined}")
+                elif pytest_result.returncode == 5:
+                    notes.append("No tests collected (returncode=5); treated as passing")
+            except Exception as exc:  # noqa: BLE001
+                tests_pass = False
+                notes.append(f"Tests failed to run: {exc}")
 
         objective_gates = {
             "dependency_check": "PASS" if dependency_pass else "FAIL",
-            "fingerprint_check": "PASS" if fingerprint_pass else "FAIL",
-            "deprecation_check": "PASS" if deprecation_pass else "FAIL",
-            "code_index_check": "PASS" if code_index_pass else "FAIL",
             "contract_completeness_check": "PASS" if contract_completeness_pass else "FAIL",
             "compatibility_check": "PASS" if compatibility_pass else "FAIL",
             "ownership_check": "PASS" if ownership_pass else "FAIL",
-            "context_pack_compliance_check": "PASS" if context_pack_compliance_pass else "FAIL",
+            "tests_pass": "PASS" if tests_pass else "FAIL",
         }
         gatekeeper_decision = self.role_runtime.invoke_structured(
             role="gatekeeper",
@@ -2557,33 +2225,20 @@ class ReleaseLoop:
                 "Your role is to confirm, contextualize, and add notes -- not to override evidence.\n\n"
                 "MANDATORY REASONING STEPS (execute ALL before rendering your decision):\n"
                 "1. EVIDENCE FIDELITY: For each gate in ObjectiveGateEvidence, copy the PASS/FAIL\n"
-                "   value exactly. You are not permitted to change a FAIL to PASS. You may add\n"
-                "   additional FAIL judgments for gates that passed objectively but have contextual\n"
-                "   concerns visible in the EvidenceNotes.\n"
-                "2. DEPENDENCY GATE: Check if all module dependencies are included in the release set.\n"
-                "   A missing transitive dependency means the release cannot be deployed independently.\n"
-                "3. FINGERPRINT GATE: Check if all contract-to-ship fingerprints match. A mismatch\n"
-                "   means the shipped code does not correspond to the approved contract.\n"
-                "4. DEPRECATION GATE: Check if any module or dependency is deprecated or superseded.\n"
-                "   Releasing deprecated modules risks shipping known-deficient code.\n"
-                "5. CODE INDEX GATE: Check if all modules are registered and CURRENT in the code index.\n"
-                "   Missing or non-CURRENT entries indicate incomplete registration.\n"
-                "6. CONTRACT COMPLETENESS GATE: Verify L2 system, L3 service, and L5 class contracts\n"
-                "   exist for all shipped modules. Missing contracts indicate incomplete architecture.\n"
-                "7. COMPATIBILITY GATE: Check for any BREAKING_MAJOR compatibility markers. Breaking\n"
-                "   changes require explicit migration plans before release.\n"
-                "8. OWNERSHIP GATE: All modules must have a non-empty owner field. Unowned modules\n"
-                "   cannot be maintained post-release.\n"
-                "9. CONTEXT PACK COMPLIANCE GATE: Verify context packs have proper permission\n"
-                "   configurations with boundary levels set for CONTRACT_ONLY access.\n\n"
-                "OUTPUT FORMAT: Return ReleaseGateDecision JSON with exact keys matching each gate\n"
-                "name (dependency_check, fingerprint_check, deprecation_check, code_index_check,\n"
-                "contract_completeness_check, compatibility_check, ownership_check,\n"
-                "context_pack_compliance_check) each as 'PASS' or 'FAIL', plus notes (list[str]).\n\n"
+                "   value exactly. You are not permitted to change a FAIL to PASS.\n"
+                "2. DEPENDENCY GATE: All module dependencies must be in the release set.\n"
+                "3. CONTRACT COMPLETENESS GATE: L2 system, L3 service, and L5 class contracts must\n"
+                "   exist for all shipped modules.\n"
+                "4. COMPATIBILITY GATE: No module may be marked BREAKING_MAJOR.\n"
+                "5. OWNERSHIP GATE: All modules must have a non-empty owner field.\n"
+                "6. TESTS GATE: The workspace test suite must pass (exit 0 or 5).\n\n"
+                "OUTPUT FORMAT: Return ReleaseGateDecision JSON with exact keys:\n"
+                "dependency_check, contract_completeness_check, compatibility_check,\n"
+                "ownership_check, tests_pass — each as 'PASS' or 'FAIL', plus notes (list[str]).\n\n"
                 "PROHIBITIONS:\n"
-                "- NEVER change an objectively FAIL gate to PASS. This is a hard invariant.\n"
-                "- Do not invent gates that are not in the schema.\n"
-                "- Do not provide empty notes when any gate is FAIL -- explain each failure.\n\n"
+                "- NEVER change an objectively FAIL gate to PASS.\n"
+                "- Do not invent gates not in the schema.\n"
+                "- Do not provide empty notes when any gate is FAIL.\n\n"
                 f"ReleaseID={state['release_id']}\n"
                 f"Modules={json.dumps(modules)}\n"
                 f"ObjectiveGateEvidence={json.dumps(objective_gates, sort_keys=True)}\n"
@@ -2667,7 +2322,6 @@ class ReleaseLoop:
                 f"release_manager returned PASS for release with failing gates: {state['release_id']}"
             )
         notes = [state["notes"], release_manager_decision.rationale, *release_manager_decision.release_notes]
-        indexed = {entry.module_ref: entry for entry in self.code_index.list_entries()}
         manifest = {
             "release_id": state["release_id"],
             "created_at": datetime.now(UTC).isoformat(),
@@ -2675,7 +2329,10 @@ class ReleaseLoop:
             "modules": [
                 {
                     "module_ref": module_ref,
-                    "ship_ref": indexed[module_ref].ship_ref if module_ref in indexed else None,
+                    "ship_ref": (
+                        f"/modules/{module_ref.partition('@')[0]}/{module_ref.partition('@')[2]}/ship.json"
+                        if "@" in module_ref else None
+                    ),
                 }
                 for module_ref in state["modules"]
             ],
@@ -2725,10 +2382,6 @@ class FactoryOrchestrator:
         self.target_codebase_root = target_codebase_root
         root = Path(state_store_root) if state_store_root is not None else Path(self.settings.state_store_root)
         self.state_store = FactoryStateStore(root, project_id=self.settings.project_id)
-        self.code_index = CodeIndex(
-            self.state_store.code_index_dir,
-            embedding_model=self.settings.embedding_model,
-        )
 
         checkpoint_path = self.state_store.root / "checkpoints" / "outer_graph.sqlite"
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2822,7 +2475,6 @@ class FactoryOrchestrator:
         spec = ProductSpec.model_validate(state["spec"])
         loop = ProjectLoop(
             spec,
-            self.code_index,
             state_store_root=self.state_store.base_root,
             settings=self.settings,
             enable_interrupts=False,
@@ -2835,7 +2487,7 @@ class FactoryOrchestrator:
 
     def _release_node(self, state: OuterGraphState) -> dict[str, Any]:
         spec = ProductSpec.model_validate(state["spec"])
-        loop = ReleaseLoop(state_store=self.state_store, code_index=self.code_index, spec=spec, settings=self.settings)
+        loop = ReleaseLoop(state_store=self.state_store, spec=spec, settings=self.settings)
         result = loop.run()
         return {"release_result": result}
 

@@ -1,1 +1,1 @@
-{"stage":"engineering_loop","role":"micro_planner","model_tier":"frontier","temperature":0.1,"max_context_tokens":64000,"context_policy":"strict_pack","allowed_context_sections":["task_md","io_contract_sketch","code_index_contracts","micro_plan","service_contracts","system_contracts"]}
+{"stage":"engineering_loop","role":"micro_planner","model_tier":"frontier","temperature":0.1,"max_context_tokens":64000,"context_policy":"strict_pack","allowed_context_sections":["task_md","io_contract_sketch","micro_plan","service_contracts","system_contracts"]}

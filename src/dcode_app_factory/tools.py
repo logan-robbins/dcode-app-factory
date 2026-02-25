@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -330,6 +331,12 @@ def emit_structured_spec_tool(spec_json: str, output_path: str) -> str:
     return str(path)
 
 
+def _project_root_from_env() -> Path:
+    """Derive the project-scoped state store root from environment settings."""
+    settings = RuntimeSettings.from_env()
+    return project_scoped_root(Path(settings.state_store_root), settings.project_id)
+
+
 @tool("search_code_index")
 def search_code_index(
     query: str,
@@ -379,6 +386,151 @@ def search_code_index(
         }
         for match in matches
     ]
+    return json.dumps(results, indent=2)
+
+
+def _workspace_root() -> Path:
+    """Return the workspace root path from settings, defaulting to cwd."""
+    return RuntimeSettings.from_env().workspace_root_path
+
+
+def _guard_path(path: str, workspace_root: Path) -> Path:
+    """Resolve a relative path and guard against traversal outside workspace_root.
+
+    Args:
+        path: Relative path string to resolve.
+        workspace_root: Absolute workspace root path.
+
+    Returns:
+        Resolved absolute path guaranteed to be inside workspace_root.
+
+    Raises:
+        ValueError: If the resolved path escapes workspace_root.
+    """
+    resolved = (workspace_root / path).resolve()
+    if not str(resolved).startswith(str(workspace_root.resolve())):
+        raise ValueError(f"Path traversal detected: {path!r} resolves outside workspace root")
+    return resolved
+
+
+@tool("read_file")
+def read_file(path: str) -> str:
+    """Read a file relative to the workspace root and return its contents.
+
+    Args:
+        path: File path relative to workspace_root.
+
+    Returns:
+        File contents as a string.
+
+    Raises:
+        ValueError: If path escapes workspace_root.
+        FileNotFoundError: If the file does not exist.
+    """
+    workspace_root = _workspace_root()
+    resolved = _guard_path(path, workspace_root)
+    return resolved.read_text(encoding="utf-8")
+
+
+@tool("write_file")
+def write_file(path: str, content: str) -> str:
+    """Write content to a file relative to the workspace root, creating parent dirs.
+
+    Args:
+        path: File path relative to workspace_root.
+        content: Text content to write.
+
+    Returns:
+        The resolved file path as a string.
+
+    Raises:
+        ValueError: If path escapes workspace_root.
+    """
+    workspace_root = _workspace_root()
+    resolved = _guard_path(path, workspace_root)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text(content, encoding="utf-8")
+    return str(resolved)
+
+
+@tool("run_command")
+def run_command(command: str) -> str:
+    """Run a shell command in the workspace root and return combined stdout+stderr.
+
+    Args:
+        command: Shell command string to execute.
+
+    Returns:
+        Combined stdout and stderr output (truncated to 8000 chars if large).
+    """
+    workspace_root = _workspace_root()
+    result = subprocess.run(
+        command,
+        shell=True,
+        cwd=str(workspace_root),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    output = result.stdout + result.stderr
+    if len(output) > 8000:
+        output = output[:8000] + "\n...[truncated]"
+    return output
+
+
+@tool("list_files")
+def list_files(pattern: str) -> str:
+    """List files in the workspace matching a glob pattern.
+
+    Args:
+        pattern: Glob pattern relative to workspace_root (e.g. ``**/*.py``).
+
+    Returns:
+        JSON array of relative file paths matching the pattern.
+    """
+    workspace_root = _workspace_root().resolve()
+    matches = [
+        str(p.relative_to(workspace_root))
+        for p in workspace_root.glob(pattern)
+        if p.is_file()
+    ]
+    matches.sort()
+    return json.dumps(matches, indent=2)
+
+
+@tool("search_files")
+def search_files(query: str, pattern: str = "**/*.py") -> str:
+    """Search files in the workspace for a case-insensitive substring.
+
+    Args:
+        query: Substring to search for (case-insensitive).
+        pattern: Glob pattern to filter which files to search. Defaults to ``**/*.py``.
+
+    Returns:
+        JSON array of ``{file, line_number, line}`` objects for each match,
+        limited to 50 results.
+    """
+    workspace_root = _workspace_root().resolve()
+    query_lower = query.lower()
+    results: list[dict[str, Any]] = []
+    for p in workspace_root.glob(pattern):
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            if query_lower in line.lower():
+                results.append({
+                    "file": str(p.relative_to(workspace_root)),
+                    "line_number": line_no,
+                    "line": line.rstrip(),
+                })
+                if len(results) >= 50:
+                    break
+        if len(results) >= 50:
+            break
     return json.dumps(results, indent=2)
 
 

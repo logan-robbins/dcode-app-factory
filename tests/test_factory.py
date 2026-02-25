@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 import json
@@ -16,8 +15,6 @@ from dcode_app_factory import (
     ArtifactStatus,
     ArtifactType,
     Challenge,
-    CodeIndex,
-    CodeIndexStatus,
     EngineeringLoop,
     FactoryOrchestrator,
     MicroModuleContract,
@@ -46,7 +43,6 @@ from dcode_app_factory.models import (
     ChallengeFailure,
     AdjudicationDecision,
     CompatibilityExpectation,
-    ContractCompatibility,
     CompatibilityRule,
     ContractErrorSurface,
     ContractInput,
@@ -467,58 +463,6 @@ def _build_mock_product_spec(
 
 
 @pytest.fixture(autouse=True)
-def _deterministic_embeddings_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("FACTORY_EMBEDDING_MODEL", "text-embedding-3-large")
-
-    class _DeterministicEmbeddingFunction:
-        def __init__(self, *, dims: int = 96) -> None:
-            self._dims = dims
-
-        def __call__(self, input):  # noqa: ANN001,ANN201
-            if isinstance(input, str):
-                values = [input]
-            else:
-                values = [str(item) for item in input]
-            vectors: list[list[float]] = []
-            for value in values:
-                digest = hashlib.sha256(value.encode("utf-8")).digest()
-                vector = [((digest[idx % len(digest)] / 255.0) * 2.0) - 1.0 for idx in range(self._dims)]
-                vectors.append(vector)
-            return vectors
-
-        def embed_query(self, input):  # noqa: ANN001,ANN201
-            return self.__call__(input)
-
-        @staticmethod
-        def name() -> str:
-            return "default"
-
-        @staticmethod
-        def build_from_config(config: dict[str, object]):  # noqa: ANN205
-            dims_raw = config.get("dims")
-            if isinstance(dims_raw, int) and dims_raw > 0:
-                return _DeterministicEmbeddingFunction(dims=dims_raw)
-            return _DeterministicEmbeddingFunction()
-
-        def get_config(self) -> dict[str, object]:
-            return {"dims": self._dims}
-
-        def is_legacy(self) -> bool:
-            return False
-
-        def default_space(self) -> str:
-            return "cosine"
-
-        def supported_spaces(self) -> list[str]:
-            return ["cosine", "l2", "ip"]
-
-    monkeypatch.setattr(
-        "dcode_app_factory.registry._build_embedding_function",
-        lambda *, model_name: _DeterministicEmbeddingFunction(),
-    )
-
-
-@pytest.fixture(autouse=True)
 def _mock_product_spec_planner(monkeypatch: pytest.MonkeyPatch) -> None:
     def _fake_planner(
         *,
@@ -691,13 +635,10 @@ def _mock_role_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
             gates = _extract_json_after(prompt, "ObjectiveGateEvidence")
             return schema(
                 dependency_check=gates.get("dependency_check", "PASS"),
-                fingerprint_check=gates.get("fingerprint_check", "PASS"),
-                deprecation_check=gates.get("deprecation_check", "PASS"),
-                code_index_check=gates.get("code_index_check", "PASS"),
                 contract_completeness_check=gates.get("contract_completeness_check", "PASS"),
                 compatibility_check=gates.get("compatibility_check", "PASS"),
                 ownership_check=gates.get("ownership_check", "PASS"),
-                context_pack_compliance_check=gates.get("context_pack_compliance_check", "PASS"),
+                tests_pass=gates.get("tests_pass", "PASS"),
                 notes=[],
             )
         if schema is ReleaseManagerDecision:
@@ -715,7 +656,21 @@ def _mock_role_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
         tools: list,
         name: str,
     ) -> dict[str, object]:
-        _ = self, role, system_prompt, user_message, tools, name
+        _ = self, system_prompt, user_message, tools, name
+        if role == "micro_planner":
+            return MicroPlanReview(
+                approved=True,
+                rationale="plan approved by fake micro_planner",
+                blockers=[],
+                required_revisions=[],
+            ).model_dump(mode="json")
+        if role == "shipper":
+            return {
+                "files_written": [],
+                "verification_command": "uv run pytest -q",
+                "test_output": "no tests collected",
+                "test_passed": True,
+            }
         return ProductRoleReport(
             approved=True,
             summary="approved",
@@ -992,141 +947,6 @@ def test_contract_fingerprint_ignores_metadata_changes() -> None:
     assert c1.interface_fingerprint == c2.interface_fingerprint
 
 
-def test_code_index_append_only_search_and_reindex(tmp_path: Path) -> None:
-    index = CodeIndex(tmp_path)
-    contract = MicroModuleContract(
-        module_id="MM-search",
-        module_version="1.0.0",
-        name="Search Module",
-        purpose="Searches records by query",
-        tags=["search", "query"],
-        examples_ref="/modules/MM-search/1.0.0/examples.md",
-        created_by="tester",
-        inputs=[ContractInput(name="query", type="str", constraints=["non-empty"])],
-        outputs=[ContractOutput(name="items", type="list", invariants=["sorted"])],
-        error_surfaces=[ContractErrorSurface(name="ValidationError", when="empty query", surface="exception")],
-        effects=[{"type": EffectType.CALL, "target": "db", "description": "reads index"}],
-        modes=ContractModes(sync=True, **{"async": False}, notes="sync"),
-        error_cases=["empty query"],
-        dependencies=[],
-        compatibility=CompatibilityRule(backward_compatible_with=[], breaking_change_policy="major"),
-        runtime_budgets=RuntimeBudgets(latency_ms_p95=20, memory_mb_max=64),
-        status=ArtifactStatus.DRAFT,
-    )
-    index.register(contract)
-    results = index.search("module for record query", top_k=5)
-    assert results
-    assert results[0].entry.module_id == "MM-search"
-    assert index.reindex() >= 1
-
-
-def test_code_index_records_level_owner_and_compatibility(tmp_path: Path) -> None:
-    index = CodeIndex(tmp_path)
-    contract = MicroModuleContract(
-        module_id="MM-owner",
-        module_version="1.0.0",
-        name="Owner Module",
-        purpose="Tracks level-aware metadata",
-        tags=["ownership"],
-        owner="team-platform",
-        compatibility_type=ContractCompatibility.NON_BREAKING,
-        examples_ref="/modules/MM-owner/1.0.0/examples.md",
-        created_by="tester",
-        inputs=[ContractInput(name="request", type="dict", constraints=["non-empty"])],
-        outputs=[ContractOutput(name="response", type="dict", invariants=["deterministic"])],
-        error_surfaces=[ContractErrorSurface(name="ValidationError", when="bad request", surface="exception")],
-        effects=[{"type": EffectType.WRITE, "target": "state_store", "description": "writes artifacts"}],
-        modes=ContractModes(sync=True, **{"async": False}, notes="sync"),
-        error_cases=["bad request"],
-        dependencies=[],
-        compatibility=CompatibilityRule(backward_compatible_with=[], breaking_change_policy="major"),
-        runtime_budgets=RuntimeBudgets(latency_ms_p95=15, memory_mb_max=64),
-        status=ArtifactStatus.DRAFT,
-    )
-    index.register(contract)
-    entry = index.get_entry("MM-owner@1.0.0")
-    assert entry is not None
-    assert entry.level == BoundaryLevel.L4_COMPONENT
-    assert entry.owner == "team-platform"
-    assert entry.compatibility_type == ContractCompatibility.NON_BREAKING
-
-
-def test_code_index_get_and_items_return_latest_persisted_contract(tmp_path: Path) -> None:
-    state_store = FactoryStateStore(tmp_path, project_id="ACME-IDX-GET")
-    index = CodeIndex(state_store.code_index_dir, embedding_model="text-embedding-3-large")
-
-    base_contract = dict(
-        module_id="MM-history",
-        name="Historical Module",
-        purpose="Tracks contract versions",
-        tags=["history"],
-        examples_ref="/modules/MM-history/1.0.0/examples.md",
-        created_by="tester",
-        inputs=[ContractInput(name="request", type="dict", constraints=["non-empty"])],
-        outputs=[ContractOutput(name="response", type="dict", invariants=["deterministic"])],
-        error_surfaces=[ContractErrorSurface(name="ValidationError", when="bad request", surface="exception")],
-        effects=[{"type": EffectType.WRITE, "target": "state_store", "description": "writes artifacts"}],
-        modes=ContractModes(sync=True, **{"async": False}, notes="sync"),
-        error_cases=["bad request"],
-        dependencies=[],
-        compatibility=CompatibilityRule(backward_compatible_with=[], breaking_change_policy="major"),
-        runtime_budgets=RuntimeBudgets(latency_ms_p95=15, memory_mb_max=64),
-        status=ArtifactStatus.DRAFT,
-    )
-    contract_v1 = MicroModuleContract(module_version="1.0.0", **base_contract)
-    contract_v2 = MicroModuleContract(module_version="1.0.1", **base_contract)
-    index.register(contract_v1)
-    index.register(contract_v2)
-
-    for contract in (contract_v1, contract_v2):
-        contract_path = state_store.modules_dir / contract.module_id / contract.module_version / "contract.json"
-        contract_path.parent.mkdir(parents=True, exist_ok=True)
-        contract_path.write_text(contract.model_dump_json(indent=2, by_alias=True), encoding="utf-8")
-
-    loaded = index.get("MM-history")
-    assert loaded is not None
-    assert loaded.module_version == "1.0.1"
-
-    items = index.items()
-    assert len(items) == 1
-    slug, latest = items[0]
-    assert slug == "historical-module"
-    assert latest.module_version == "1.0.1"
-
-
-def test_code_index_reindexes_when_embedding_model_changes(tmp_path: Path) -> None:
-    index = CodeIndex(tmp_path, embedding_model="text-embedding-3-large")
-    contract = MicroModuleContract(
-        module_id="MM-reindex",
-        module_version="1.0.0",
-        name="Reindex Module",
-        purpose="Validate and normalize request boundary for stock ranking",
-        tags=["validation", "stocks"],
-        examples_ref="/modules/MM-reindex/1.0.0/examples.md",
-        created_by="tester",
-        inputs=[ContractInput(name="request", type="dict", constraints=["non-empty"])],
-        outputs=[ContractOutput(name="response", type="dict", invariants=["deterministic"])],
-        error_surfaces=[ContractErrorSurface(name="ValidationError", when="malformed request", surface="exception")],
-        effects=[{"type": EffectType.WRITE, "target": "state_store", "description": "writes artifacts"}],
-        modes=ContractModes(sync=True, **{"async": False}, notes="sync"),
-        error_cases=["malformed request"],
-        dependencies=[],
-        compatibility=CompatibilityRule(backward_compatible_with=[], breaking_change_policy="major"),
-        runtime_budgets=RuntimeBudgets(latency_ms_p95=15, memory_mb_max=32),
-        status=ArtifactStatus.DRAFT,
-    )
-    index.register(contract)
-
-    CodeIndex(tmp_path, embedding_model="text-embedding-3-small")
-    assert (tmp_path / "embedding_model.txt").read_text(encoding="utf-8").strip() == "text-embedding-3-small"
-    events = [
-        line.strip()
-        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert any("embedding_model_changed" in line for line in events)
-
-
 def test_interface_change_exception_requires_non_empty_delta() -> None:
     with pytest.raises(ValueError):
         InterfaceChangeException(
@@ -1389,7 +1209,6 @@ def test_project_loop_happy_path_with_mocked_debate(monkeypatch: pytest.MonkeyPa
     spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
     loop = ProjectLoop(
         spec,
-        CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index"),
         state_store_root=tmp_path,
         settings=settings,
         enable_interrupts=False,
@@ -1463,7 +1282,6 @@ def test_project_loop_emits_levelled_contract_artifacts(monkeypatch: pytest.Monk
     spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
     project = ProjectLoop(
         spec,
-        CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index"),
         state_store_root=tmp_path,
         settings=settings,
         enable_interrupts=False,
@@ -1493,7 +1311,6 @@ def test_project_loop_halt_blocks_downstream(monkeypatch: pytest.MonkeyPatch, tm
     spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
     loop = ProjectLoop(
         spec,
-        CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index"),
         state_store_root=tmp_path,
         settings=settings,
         enable_interrupts=False,
@@ -1504,29 +1321,6 @@ def test_project_loop_halt_blocks_downstream(monkeypatch: pytest.MonkeyPatch, tm
     statuses = {task_id: entry.status for task_id, entry in state.tasks.items()}
     assert TaskStatus.HALTED in statuses.values()
     assert TaskStatus.BLOCKED in statuses.values()
-
-
-def test_release_loop_flags_deprecated_dependency(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("dcode_app_factory.loops.ProductLoop._invoke_deep_agent", lambda self, spec_json_path: None)
-    monkeypatch.setattr("dcode_app_factory.loops.DebateGraph", _FakeDebateGraphPass)
-
-    settings = RuntimeSettings(
-        state_store_root=str(tmp_path),
-        project_id="ACME-003",
-        embedding_model="text-embedding-3-large",
-    )
-    spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
-    code_index = CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index")
-    project = ProjectLoop(spec, code_index, state_store_root=tmp_path, settings=settings, enable_interrupts=False)
-    assert project.run() is True
-
-    entries = code_index.list_entries()
-    assert entries
-    code_index.set_status(entries[0].module_ref, status=CodeIndexStatus.DEPRECATED, deprecation_reason="replacement available")
-
-    release = ReleaseLoop(state_store=project.state_store, code_index=code_index, spec=spec)
-    result = release.run()
-    assert result["integration_gates"]["deprecation_check"] == "FAIL"
 
 
 def test_release_loop_includes_new_contract_and_context_gates(
@@ -1542,21 +1336,20 @@ def test_release_loop_includes_new_contract_and_context_gates(
         embedding_model="text-embedding-3-large",
     )
     spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
-    code_index = CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index")
-    project = ProjectLoop(spec, code_index, state_store_root=tmp_path, settings=settings, enable_interrupts=False)
+    project = ProjectLoop(spec, state_store_root=tmp_path, settings=settings, enable_interrupts=False)
     assert project.run() is True
 
-    release = ReleaseLoop(state_store=project.state_store, code_index=code_index, spec=spec)
+    release = ReleaseLoop(state_store=project.state_store, spec=spec)
     result = release.run()
     gates = result["integration_gates"]
     assert "contract_completeness_check" in gates
     assert "compatibility_check" in gates
     assert "ownership_check" in gates
-    assert "context_pack_compliance_check" in gates
+    assert "tests_pass" in gates
     assert gates["contract_completeness_check"] == "PASS"
     assert gates["compatibility_check"] == "PASS"
     assert gates["ownership_check"] == "PASS"
-    assert gates["context_pack_compliance_check"] == "PASS"
+    assert gates["tests_pass"] == "PASS"
     manifest_path = project.state_store.release_dir / f"{result['release_id']}.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert all(module["ship_ref"] is None or module["ship_ref"].startswith("/modules/") for module in manifest["modules"])
@@ -1569,7 +1362,6 @@ def test_release_loop_expands_transitive_dependencies(tmp_path: Path) -> None:
         embedding_model="text-embedding-3-large",
     )
     state_store = FactoryStateStore(tmp_path, project_id=settings.project_id)
-    code_index = CodeIndex(state_store.code_index_dir, embedding_model=settings.embedding_model)
 
     spec = parse_raw_spec_to_product_spec("# Product\n## A")
     apply_canonical_task_ids(spec)
@@ -1619,7 +1411,6 @@ def test_release_loop_expands_transitive_dependencies(tmp_path: Path) -> None:
         **base_contract,
     )
     for idx, contract in enumerate((contract_a_100, contract_a_101, contract_b_100), start=1):
-        code_index.register(contract)
         module_dir = state_store.modules_dir / contract.module_id / contract.module_version
         tests_dir = module_dir / "tests"
         tests_dir.mkdir(parents=True, exist_ok=True)
@@ -1661,11 +1452,10 @@ def test_release_loop_expands_transitive_dependencies(tmp_path: Path) -> None:
             encoding="utf-8",
         )
 
-    release = ReleaseLoop(state_store=state_store, code_index=code_index, spec=spec)
+    release = ReleaseLoop(state_store=state_store, spec=spec)
     result = release.run()
     assert "MM-a@1.0.0" in result["modules"]
     assert result["integration_gates"]["dependency_check"] == "PASS"
-    assert result["integration_gates"]["fingerprint_check"] == "PASS"
 
 
 def test_outer_graph_runs_auto_approve_with_mocked_debate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1708,7 +1498,6 @@ def test_micro_plan_decomposes_into_atomic_modules(tmp_path: Path) -> None:
     )
     state_store = FactoryStateStore(tmp_path, project_id=settings.project_id)
     loop = EngineeringLoop(
-        code_index=CodeIndex(state_store.code_index_dir, embedding_model=settings.embedding_model),
         state_store=state_store,
         settings=settings,
     )
@@ -1730,30 +1519,8 @@ def test_micro_plan_can_select_reuse_candidate(tmp_path: Path) -> None:
         embedding_model="text-embedding-3-large",
     )
     state_store = FactoryStateStore(tmp_path, project_id=settings.project_id)
-    index = CodeIndex(state_store.code_index_dir, embedding_model=settings.embedding_model)
-    existing = MicroModuleContract(
-        module_id="MM-existing",
-        module_version="1.0.0",
-        name="Input Boundary Validator",
-        purpose="Validate and normalize request boundary for Build trader API ranking website",
-        tags=["validate", "normalize", "boundary"],
-        examples_ref="/modules/MM-existing/1.0.0/examples.md",
-        created_by="tester",
-        inputs=[ContractInput(name="request", type="dict", constraints=["schema-valid"])],
-        outputs=[ContractOutput(name="validated", type="dict", invariants=["normalized"])],
-        error_surfaces=[ContractErrorSurface(name="ValidationError", when="bad payload", surface="exception")],
-        effects=[{"type": EffectType.WRITE, "target": "state_store", "description": "writes validation traces"}],
-        modes=ContractModes(sync=True, **{"async": False}, notes="sync"),
-        error_cases=["bad payload"],
-        dependencies=[],
-        compatibility=CompatibilityRule(backward_compatible_with=[], breaking_change_policy="major"),
-        runtime_budgets=RuntimeBudgets(latency_ms_p95=12, memory_mb_max=24),
-        status=ArtifactStatus.DRAFT,
-    )
-    index.register(existing)
 
     loop = EngineeringLoop(
-        code_index=index,
         state_store=state_store,
         settings=settings,
     )
@@ -1762,7 +1529,8 @@ def test_micro_plan_can_select_reuse_candidate(tmp_path: Path) -> None:
     task = spec.iter_tasks()[0]
     plan = loop._build_micro_plan(task)
 
-    assert any(module.reuse_decision == ReuseDecision.REUSE for module in plan.modules)
+    # Without a CodeIndex, all modules should default to CREATE_NEW
+    assert all(module.reuse_decision == ReuseDecision.CREATE_NEW for module in plan.modules)
 
 
 def test_engineering_loop_resolves_dependency_refs_and_versions_examples_path(tmp_path: Path) -> None:
@@ -1773,7 +1541,6 @@ def test_engineering_loop_resolves_dependency_refs_and_versions_examples_path(tm
     )
     state_store = FactoryStateStore(tmp_path, project_id=settings.project_id)
     loop = EngineeringLoop(
-        code_index=CodeIndex(state_store.code_index_dir, embedding_model=settings.embedding_model),
         state_store=state_store,
         settings=settings,
     )
@@ -1822,19 +1589,8 @@ def test_engineering_loop_resolves_dependency_refs_and_versions_examples_path(tm
     assert [entry.ref for entry in contract.dependencies] == ["MM-dep-source@2.4.6"]
     assert contract.examples_ref.endswith(f"/{contract.module_version}/examples.md")
 
-    evidence_ref, coverage_ref = loop._materialize_and_verify_module(contract=contract)
-    evidence_path = state_store.root / evidence_ref.lstrip("/")
-    coverage_path = state_store.root / coverage_ref.lstrip("/")
-    examples_path = state_store.modules_dir / contract.module_id / contract.module_version / "examples.md"
-    implementation_path = state_store.modules_dir / contract.module_id / contract.module_version / "implementation" / "module.py"
-
-    assert evidence_path.is_file()
-    assert coverage_path.is_file()
-    assert implementation_path.is_file()
-    examples = examples_path.read_text(encoding="utf-8")
-    assert "{\"sample\": true}" not in examples
-    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
-    assert payload["result"] == "PASS"
+    # _materialize_and_verify_module was replaced by _ship_module (real-filesystem agent);
+    # the assertions above already verify dependency resolution and contract building.
 
 
 def test_project_loop_dispatcher_null_ready_queue_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1846,7 +1602,6 @@ def test_project_loop_dispatcher_null_ready_queue_raises(monkeypatch: pytest.Mon
     spec = ProductLoop("# Product\n## A", state_store_root=tmp_path, settings=settings).run()
     loop = ProjectLoop(
         spec,
-        CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index"),
         state_store_root=tmp_path,
         settings=settings,
         enable_interrupts=False,
@@ -1878,7 +1633,6 @@ def test_project_loop_dispatch_halts_when_unresolved_tasks_have_no_ready_queue(t
     spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
     loop = ProjectLoop(
         spec,
-        CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index"),
         state_store_root=tmp_path,
         settings=settings,
         enable_interrupts=False,
@@ -1907,7 +1661,6 @@ def test_project_loop_unblocks_only_when_dependencies_are_shipped(tmp_path: Path
     spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
     loop = ProjectLoop(
         spec,
-        CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index"),
         state_store_root=tmp_path,
         settings=settings,
         enable_interrupts=False,
@@ -1937,7 +1690,6 @@ def test_project_loop_resolution_requeues_and_clears_halt_metadata(tmp_path: Pat
     spec = ProductLoop("# Product\n## A", state_store_root=tmp_path, settings=settings).run()
     loop = ProjectLoop(
         spec,
-        CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index"),
         state_store_root=tmp_path,
         settings=settings,
         enable_interrupts=False,
@@ -2160,34 +1912,3 @@ def test_outer_graph_project_failure_skips_release(
     result = orchestrator.run(approval_action="APPROVE")
     assert result["project_success"] is False
     assert "release_result" not in result or result.get("release_result") is None
-
-
-def test_release_loop_overall_result_fail_when_gate_fails(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """When a release gate fails, the overall_result should be FAIL and the
-    specific failing gate must be present in the result dict.
-    """
-    monkeypatch.setattr("dcode_app_factory.loops.ProductLoop._invoke_deep_agent", lambda self, spec_json_path: None)
-    monkeypatch.setattr("dcode_app_factory.loops.DebateGraph", _FakeDebateGraphPass)
-
-    settings = RuntimeSettings(
-        state_store_root=str(tmp_path),
-        project_id="ACME-REL-FAIL",
-        embedding_model="text-embedding-3-large",
-    )
-    spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
-    code_index = CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index")
-    project = ProjectLoop(spec, code_index, state_store_root=tmp_path, settings=settings, enable_interrupts=False)
-    assert project.run() is True
-
-    # Deprecate a module to cause deprecation_check gate to fail
-    entries = code_index.list_entries()
-    assert entries
-    code_index.set_status(entries[0].module_ref, status=CodeIndexStatus.DEPRECATED, deprecation_reason="obsolete")
-
-    release = ReleaseLoop(state_store=project.state_store, code_index=code_index, spec=spec)
-    result = release.run()
-    assert result["overall_result"] == "FAIL"
-    assert result["integration_gates"]["deprecation_check"] == "FAIL"

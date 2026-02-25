@@ -22,6 +22,7 @@ class RuntimeSettings:
     recursion_limit: int = 1_000
     checkpoint_db: str = "state_store/checkpoints/langgraph.sqlite"
     class_contract_policy: str = "selective_shared"
+    workspace_root: str = ""
 
     @classmethod
     def from_env(cls) -> "RuntimeSettings":
@@ -39,7 +40,13 @@ class RuntimeSettings:
             recursion_limit=_get_env_int("FACTORY_RECURSION_LIMIT", default=1_000, minimum=100),
             checkpoint_db=os.getenv("FACTORY_CHECKPOINT_DB", "state_store/checkpoints/langgraph.sqlite"),
             class_contract_policy=os.getenv("FACTORY_CLASS_CONTRACT_POLICY", "selective_shared"),
+            workspace_root=os.getenv("FACTORY_WORKSPACE_ROOT", ""),
         ).normalized()
+
+    @property
+    def workspace_root_path(self) -> Path:
+        """Return the workspace root as a Path, defaulting to cwd if unset."""
+        return Path(self.workspace_root) if self.workspace_root else Path.cwd()
 
     def normalized(self) -> "RuntimeSettings":
         """Validate and normalize all fields. Raises ValueError on invalid configuration."""
@@ -99,6 +106,7 @@ class RuntimeSettings:
             recursion_limit=self.recursion_limit,
             checkpoint_db=self.checkpoint_db,
             class_contract_policy=class_contract_policy,
+            workspace_root=self.workspace_root,
         )
 
     def default_request_file(self, repo_root: Path) -> Path:

@@ -259,25 +259,19 @@ class ReleaseGateDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     dependency_check: Literal["PASS", "FAIL"]
-    fingerprint_check: Literal["PASS", "FAIL"]
-    deprecation_check: Literal["PASS", "FAIL"]
-    code_index_check: Literal["PASS", "FAIL"]
     contract_completeness_check: Literal["PASS", "FAIL"]
     compatibility_check: Literal["PASS", "FAIL"]
     ownership_check: Literal["PASS", "FAIL"]
-    context_pack_compliance_check: Literal["PASS", "FAIL"]
+    tests_pass: Literal["PASS", "FAIL"]
     notes: list[str] = Field(default_factory=list)
 
     def gate_map(self) -> dict[str, str]:
         return {
             "dependency_check": self.dependency_check,
-            "fingerprint_check": self.fingerprint_check,
-            "deprecation_check": self.deprecation_check,
-            "code_index_check": self.code_index_check,
             "contract_completeness_check": self.contract_completeness_check,
             "compatibility_check": self.compatibility_check,
             "ownership_check": self.ownership_check,
-            "context_pack_compliance_check": self.context_pack_compliance_check,
+            "tests_pass": self.tests_pass,
         }
 
 
@@ -748,6 +742,13 @@ class ComponentContract(MicroModuleContract):
     """Canonical L4 contract type."""
 
 
+class FileSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str        # relative to workspace_root
+    content: str
+
+
 class ShipVerification(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -774,7 +775,9 @@ class ShipEvidence(BaseModel):
     verification: ShipVerification
     environment: ShipEnvironment
     test_artifact_refs: list[str] = Field(default_factory=list)
-    coverage_report_ref: str | None = None
+    files_written: list[str] = Field(default_factory=list)
+    test_output: str = ""
+    test_passed: bool = False
     ship_time: datetime
 
 

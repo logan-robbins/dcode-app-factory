@@ -24,6 +24,9 @@ dependencies = [
 addopts = "-q"
 testpaths = ["tests"]
 
+[project.scripts]
+dcode = "dcode_app_factory.__main__:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
