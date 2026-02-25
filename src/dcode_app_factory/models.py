@@ -301,7 +301,7 @@ class Task(BaseModel):
     description: str
     subtasks: list[str] = Field(min_length=2)
     acceptance_criteria: list[str] = Field(min_length=2)
-    depends_on: list[str] = Field(default_factory=list)
+    depends_on: list[str]
     io_contract_sketch: IOContractSketch
 
     @field_validator("task_id")

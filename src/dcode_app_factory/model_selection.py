@@ -15,7 +15,7 @@ DEFAULT_MODELS_BY_TIER: dict[str, str] = {
 
 @dataclass(frozen=True)
 class RuntimeModelSelection:
-    """Runtime model routing by tier."""
+    """Runtime agent-role routing by tier."""
 
     by_tier: dict[str, str]
 

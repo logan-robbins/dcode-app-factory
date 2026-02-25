@@ -12,7 +12,6 @@ from dcode_app_factory.settings import RuntimeSettings
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_REQUEST_TEXT = "# Product\n## Factory architecture\n## Project loop\n## Engineering debate\n"
 REQUEST_KIND_CHOICES = ["AUTO", "FULL_APP", "FEATURE", "BUGFIX", "REFACTOR", "TASK"]
 
 
@@ -72,8 +71,7 @@ def load_raw_request(*, request_file: Path | None, request_text: str | None, spe
     default_path = settings.default_request_file(REPO_ROOT)
     if default_path.is_file():
         return default_path.read_text(encoding="utf-8")
-
-    return DEFAULT_REQUEST_TEXT
+    raise FileNotFoundError(f"Default request file does not exist: {default_path}")
 
 
 def main() -> int:

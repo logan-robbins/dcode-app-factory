@@ -53,11 +53,8 @@ class DebateGraph:
         *,
         store: FactoryStateStore,
         role_runtime: RoleAgentRuntime,
-        use_llm: bool = True,
         propagate_parent_halt: bool = False,
     ) -> None:
-        if not use_llm:
-            raise ValueError("Deterministic debate mode is disabled; use_llm must be true")
         self.store = store
         self.role_runtime = role_runtime
         self.propagate_parent_halt = propagate_parent_halt

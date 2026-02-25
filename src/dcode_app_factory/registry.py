@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import json
-import math
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 import chromadb
-from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
+from chromadb.api.types import Documents, EmbeddingFunction
 from chromadb.utils import embedding_functions
 
 from .llm import ensure_openai_api_key
@@ -22,72 +20,24 @@ from .models import (
 from .utils import slugify_name
 
 
-DETERMINISTIC_MODEL_RE = re.compile(r"^deterministic-hash(?:-(\d+))?$")
-
-
-def _normalize_embedding_model_name(value: str) -> tuple[str, str]:
+def _normalize_embedding_model_name(value: str) -> str:
     model = value.strip()
     if not model:
         raise ValueError("embedding_model must be non-empty")
-
-    deterministic_match = DETERMINISTIC_MODEL_RE.match(model)
-    if deterministic_match:
-        dimensions = int(deterministic_match.group(1) or 384)
-        if dimensions <= 0:
-            raise ValueError(f"deterministic embedding dimensions must be > 0, got {dimensions}")
-        return f"deterministic-hash-{dimensions}", "deterministic"
 
     if model.startswith("openai:"):
         model = model.split(":", 1)[1].strip()
     if not model:
         raise ValueError("OpenAI embedding model must be non-empty")
-    return model, "openai"
+    return model
 
 
-def _build_embedding_function(*, model_name: str, provider: str) -> EmbeddingFunction[Documents]:
-    if provider == "deterministic":
-        match = DETERMINISTIC_MODEL_RE.match(model_name)
-        if match is None:
-            raise ValueError(f"Invalid deterministic embedding model: {model_name}")
-        dimensions = int(match.group(1) or 384)
-        return DeterministicEmbeddingFunction(dimensions=dimensions)
-
+def _build_embedding_function(*, model_name: str) -> EmbeddingFunction[Documents]:
     api_key = ensure_openai_api_key()
     return embedding_functions.OpenAIEmbeddingFunction(
         api_key=api_key,
         model_name=model_name,
     )
-
-
-class DeterministicEmbeddingFunction(EmbeddingFunction[Documents]):
-    """Dense deterministic embedding function to avoid runtime model dependencies."""
-
-    def __init__(self, dimensions: int = 384) -> None:
-        self.dimensions = dimensions
-
-    @staticmethod
-    def name() -> str:
-        return "deterministic-hash"
-
-    def get_config(self) -> dict[str, int]:
-        return {"dimensions": self.dimensions}
-
-    @staticmethod
-    def build_from_config(config: dict[str, int]) -> "DeterministicEmbeddingFunction":
-        return DeterministicEmbeddingFunction(dimensions=int(config.get("dimensions", 384)))
-
-    def __call__(self, input: Documents) -> Embeddings:
-        vectors: list[list[float]] = []
-        for text in input:
-            vec = [0.0] * self.dimensions
-            for token in text.lower().split():
-                index = hash(token) % self.dimensions
-                vec[index] += 1.0
-            norm = math.sqrt(sum(value * value for value in vec))
-            if norm > 0:
-                vec = [value / norm for value in vec]
-            vectors.append(vec)
-        return vectors
 
 
 @dataclass(frozen=True)
@@ -103,13 +53,10 @@ class CodeIndex:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
         self.events_path = self.root / "events.jsonl"
-        normalized_model, provider = _normalize_embedding_model_name(embedding_model)
-        self.embedding_model = normalized_model
-        self.embedding_model_provider = provider
+        self.embedding_model = _normalize_embedding_model_name(embedding_model)
         self.embedding_model_path = self.root / "embedding_model.txt"
         self.embedding_function = _build_embedding_function(
             model_name=self.embedding_model,
-            provider=self.embedding_model_provider,
         )
         self.client = chromadb.PersistentClient(path=str(self.root))
         self.collection = self.client.get_or_create_collection(
@@ -377,12 +324,60 @@ class CodeIndex:
         self.add_entry(entry)
         return slugify_name(contract.name)
 
+    @staticmethod
+    def _parse_semver(version: str) -> tuple[int, int, int]:
+        parts = version.split(".")
+        if len(parts) != 3 or not all(part.isdigit() for part in parts):
+            raise ValueError(f"invalid semver version: {version}")
+        return int(parts[0]), int(parts[1]), int(parts[2])
+
+    def _project_root(self) -> Path:
+        return self.root.parent
+
+    def _load_contract_for_entry(self, entry: CodeIndexEntry) -> MicroModuleContract | None:
+        contract_path = self._project_root() / entry.contract_ref.lstrip("/")
+        if not contract_path.is_file():
+            return None
+        payload = json.loads(contract_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            payload.pop("interface_fingerprint", None)
+        return MicroModuleContract.model_validate(payload)
+
     def get(self, name_or_slug: str) -> MicroModuleContract | None:
-        _ = name_or_slug
+        key = name_or_slug.strip()
+        if not key:
+            return None
+
+        candidates: list[CodeIndexEntry] = []
+        for entry in self.list_entries():
+            if key in {entry.module_ref, entry.module_id, entry.name, slugify_name(entry.name)}:
+                candidates.append(entry)
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda entry: self._parse_semver(entry.version), reverse=True)
+        for candidate in candidates:
+            contract = self._load_contract_for_entry(candidate)
+            if contract is not None:
+                return contract
         return None
 
     def items(self) -> list[tuple[str, MicroModuleContract]]:
-        return []
+        entries = self.list_entries()
+        entries.sort(key=lambda entry: (entry.module_id, self._parse_semver(entry.version)), reverse=True)
+
+        latest_by_module: dict[str, CodeIndexEntry] = {}
+        for entry in entries:
+            if entry.module_id not in latest_by_module:
+                latest_by_module[entry.module_id] = entry
+
+        rendered: list[tuple[str, MicroModuleContract]] = []
+        for module_id, entry in sorted(latest_by_module.items(), key=lambda item: item[0]):
+            contract = self._load_contract_for_entry(entry)
+            if contract is None:
+                continue
+            rendered.append((slugify_name(contract.name), contract))
+        return rendered
 
     def __len__(self) -> int:
         return len(self.list_entries())

@@ -42,7 +42,7 @@ def ensure_openai_api_key(repo_root: Path | None = None) -> str:
 
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
-        raise RuntimeError("OPENAI_API_KEY is required for model-backed execution")
+        raise RuntimeError("OPENAI_API_KEY is required for agent runtime execution")
     return key
 
 

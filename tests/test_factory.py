@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import importlib.util
+import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 import json
+import re
 
 import pytest
 from deepagents.backends import FilesystemBackend
@@ -74,6 +77,11 @@ from dcode_app_factory.models import (
     RubricAssessment,
     RuntimeBudgets,
     ShipDirective,
+    ProductSpec,
+    Pillar,
+    Epic,
+    Story,
+    IOContractSketch,
     Task,
     Urgency,
 )
@@ -87,6 +95,16 @@ from dcode_app_factory.utils import (
     slugify_name,
     validate_task_dependency_dag,
 )
+
+
+def _load_factory_main_module():
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "factory_main.py"
+    spec = importlib.util.spec_from_file_location("dcode_factory_main_script", script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to import factory_main.py from {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _pass_debate_result(target_artifact_id: str) -> DebateResult:
@@ -169,9 +187,353 @@ def _fail_debate_result(target_artifact_id: str) -> DebateResult:
     )
 
 
+_TEST_BULLET_RE = re.compile(r"^(?:[-*+]|[0-9]+[.)])\s+(.+)$")
+_TEST_SENTENCE_SPLIT_RE = re.compile(r"[.!?]\s+")
+
+
+def _extract_sections_for_mock_planner(raw_request: str) -> list[str]:
+    sections: list[str] = []
+    for line in raw_request.splitlines():
+        value = line.strip()
+        if value.startswith("##"):
+            section = value.lstrip("# ").strip()
+            if section:
+                sections.append(section)
+    if sections:
+        return sections
+
+    bullets: list[str] = []
+    prose_lines: list[str] = []
+    for line in raw_request.splitlines():
+        value = line.strip()
+        if not value or value.startswith("#"):
+            continue
+        bullet_match = _TEST_BULLET_RE.match(value)
+        if bullet_match:
+            bullets.append(bullet_match.group(1).strip())
+            continue
+        prose_lines.append(value)
+
+    if bullets:
+        return [entry for entry in bullets if entry][:6]
+
+    prose = " ".join(prose_lines).strip()
+    if not prose:
+        return []
+    sentences = [segment.strip(" -") for segment in _TEST_SENTENCE_SPLIT_RE.split(prose) if segment.strip()]
+    if len(sentences) >= 2:
+        return sentences[:6]
+    return [prose[:160]]
+
+
+def _extract_title_for_mock_planner(raw_request: str) -> str | None:
+    for line in raw_request.splitlines():
+        value = line.strip()
+        if value.startswith("# "):
+            title = value[2:].strip()
+            if title:
+                return title
+    return None
+
+
+def _summarize_request_for_mock_planner(raw_request: str, sections: list[str]) -> str:
+    title = _extract_title_for_mock_planner(raw_request)
+    if title:
+        return title[:96]
+    if sections:
+        joined = "; ".join(sections[:3])
+        return joined[:96]
+    compact = " ".join(raw_request.split())
+    return compact[:96] if compact else "requested change"
+
+
+def _infer_request_kind_for_mock_planner(raw_request: str, sections: list[str]) -> str:
+    content = raw_request.lower()
+    if "# product" in content or len(sections) >= 2:
+        return "FULL_APP"
+    return "TASK"
+
+
+def _full_app_tasks_for_mock_planner(sections: list[str]) -> list[Task]:
+    tasks: list[Task] = []
+    for idx, section in enumerate(sections, start=1):
+        task_id = f"TSK-{idx:03d}"
+        tasks.append(
+            Task(
+                task_id=task_id,
+                name=f"Implement {section}",
+                description=f"Implement the capability described in '{section}' with explicit contracts and test evidence.",
+                subtasks=[
+                    f"Define explicit input/output/error contract boundaries for {section}",
+                    f"Audit current implementation surfaces and reuse candidates for {section}",
+                    f"Implement deterministic core behavior for {section}",
+                    f"Integrate dependency adapters and side-effect handling for {section}",
+                    f"Verify acceptance criteria and ship evidence for {section}",
+                ],
+                acceptance_criteria=[
+                    "returns deterministic outputs for identical inputs",
+                    "validates and rejects malformed requests",
+                    "records verification evidence for shipped behavior",
+                ],
+                io_contract_sketch=IOContractSketch(
+                    inputs=f"Inputs required for section '{section}' including constraints and validation rules.",
+                    outputs=f"Outputs produced by section '{section}' with clear invariants.",
+                    error_surfaces="Validation error conditions and failure surfaces with explicit handling.",
+                    effects="Writes artifacts and updates state snapshots in state store.",
+                    modes="sync with explicit retry boundaries and deterministic execution.",
+                ),
+                depends_on=[f"TSK-{idx - 1:03d}"] if idx > 1 else [],
+            )
+        )
+    return tasks
+
+
+def _incremental_tasks_for_mock_planner(
+    *,
+    request_summary: str,
+    request_sections: list[str],
+    codebase_hint: str | None,
+) -> list[Task]:
+    scope = "; ".join(request_sections[:5]) if request_sections else request_summary
+    codebase_scope = (
+        f"Target codebase root: {codebase_hint}."
+        if codebase_hint
+        else "Target codebase root: current workspace checkout."
+    )
+    return [
+        Task(
+            task_id="TSK-001",
+            name=f"Analyze architecture impact for {request_summary}",
+            description=(
+                f"Perform product-owner and architect analysis for '{scope}'. "
+                f"Document impacted modules, invariants, dependencies, and delivery risks. {codebase_scope}"
+            ),
+            subtasks=[
+                "Map impacted components, services, and data boundaries in the existing codebase",
+                "Identify reusable modules and mark create-new boundaries with rationale",
+                "Enumerate migration, rollout, and failure-mode risks with mitigation notes",
+            ],
+            acceptance_criteria=[
+                "produces a concrete impact map tied to named code surfaces",
+                "records reuse-first decisions and explicit no-reuse reasons",
+                "raises blocking risks with clear decision paths",
+            ],
+            io_contract_sketch=IOContractSketch(
+                inputs="Feature request context, current architecture constraints, and repository topology.",
+                outputs="Approved architecture impact and reuse decision summary.",
+                error_surfaces="Ambiguous requirements, missing constraints, and incompatible existing contracts.",
+                effects="Writes architecture and risk decisions into tracked task artifacts.",
+                modes="sync with deterministic analysis and fail-fast on missing prerequisites.",
+            ),
+            depends_on=[],
+        ),
+        Task(
+            task_id="TSK-002",
+            name=f"Define contract-first delivery plan for {request_summary}",
+            description=(
+                f"Define system, service, and component boundaries for '{scope}' with explicit contract surfaces "
+                "before implementation."
+            ),
+            subtasks=[
+                "Define contract boundaries across L2/L3/L4 interfaces for the requested change",
+                "Specify dependency and compatibility expectations for each boundary",
+                "Generate acceptance criteria aligned to verifiable runtime behavior",
+            ],
+            acceptance_criteria=[
+                "produces explicit I/O and error contracts for each planned boundary",
+                "validates dependency ordering and compatibility expectations",
+                "records testable acceptance criteria for delivery",
+            ],
+            io_contract_sketch=IOContractSketch(
+                inputs="Impact analysis outputs and reusable contract references.",
+                outputs="Contract-first implementation plan with ordered module boundaries.",
+                error_surfaces="Contract ambiguities, dependency cycles, and unresolved compatibility gaps.",
+                effects="Writes contract artifacts and context packs for engineering execution.",
+                modes="sync with deterministic dependency ordering and strict validation.",
+            ),
+            depends_on=["TSK-001"],
+        ),
+        Task(
+            task_id="TSK-003",
+            name=f"Implement and verify {request_summary}",
+            description=(
+                f"Implement '{scope}' against approved boundaries, run verification, and produce release-quality evidence."
+            ),
+            subtasks=[
+                "Implement module changes using approved reusable artifacts and defined contracts",
+                "Execute verification checks and capture ship evidence",
+                "Confirm release readiness and compatibility for downstream consumers",
+            ],
+            acceptance_criteria=[
+                "creates implementation artifacts that satisfy declared contracts",
+                "produces verification evidence demonstrating acceptance coverage",
+                "updates release metadata and compatibility outcomes",
+            ],
+            io_contract_sketch=IOContractSketch(
+                inputs="Approved contract plan, context packs, and existing dependency artifacts.",
+                outputs="Shippable module artifacts with verification evidence.",
+                error_surfaces="Implementation regressions, failed verification checks, and dependency incompatibilities.",
+                effects="Writes shipped artifacts, debate outputs, and release gate evidence.",
+                modes="sync with deterministic retries bounded by adjudication policy.",
+            ),
+            depends_on=["TSK-002"],
+        ),
+    ]
+
+
+def _build_mock_product_spec(
+    *,
+    raw_request: str,
+    spec_id: str,
+    request_kind: str,
+    target_codebase_root: str | None,
+) -> ProductSpec:
+    sections = _extract_sections_for_mock_planner(raw_request)
+    if not sections:
+        sections = ["Factory Core", "Project Orchestration", "Engineering Debate"]
+
+    normalized_kind = request_kind
+    if normalized_kind == "AUTO":
+        normalized_kind = _infer_request_kind_for_mock_planner(raw_request, sections)
+
+    request_summary = _summarize_request_for_mock_planner(raw_request, sections)
+    if normalized_kind == "FULL_APP":
+        tasks = _full_app_tasks_for_mock_planner(sections)
+        pillar_name = "Reliable Factory Core"
+        pillar_description = "Deterministic and auditable software factory execution."
+        pillar_rationale = "Reliability and traceability are required for autonomous delivery."
+        epic_name = "End-to-end Orchestration"
+        epic_description = "Implements product, project, engineering, and release flows."
+        story_name = "Deliver deterministic execution"
+        story_description = "Ensure execution remains deterministic and auditable."
+        behavior = "Operators can run and inspect a complete auditable pipeline."
+        title = _extract_title_for_mock_planner(raw_request) or "AI Software Product Factory"
+        description = "Contract-first factory specification generated from markdown source."
+    else:
+        tasks = _incremental_tasks_for_mock_planner(
+            request_summary=request_summary,
+            request_sections=sections,
+            codebase_hint=target_codebase_root,
+        )
+        pillar_name = "Incremental Change Delivery"
+        pillar_description = "Contract-first and reuse-first delivery for existing systems."
+        pillar_rationale = "Feature velocity must preserve architecture integrity and compatibility."
+        epic_name = "Task-Oriented Delivery Loop"
+        epic_description = "Runs product, project, engineering, and release loops for any scoped change request."
+        story_name = "Deliver change safely in existing codebases"
+        story_description = "Turn a task request into analyzed, contract-defined, and verified shipped work."
+        behavior = "Operators can submit a single task request and receive a release-gated result."
+        title = _extract_title_for_mock_planner(raw_request) or f"{normalized_kind.title()} Delivery Request"
+        description = (
+            f"Contract-first work plan generated from a {normalized_kind.lower()} request with "
+            "reuse-first and separation-of-concerns constraints."
+        )
+
+    now = datetime.now(UTC)
+    return ProductSpec(
+        spec_id=spec_id,
+        spec_version="1.0.0",
+        title=title,
+        description=description,
+        created_at=now,
+        updated_at=now,
+        pillars=[
+            Pillar(
+                pillar_id="PIL-001",
+                name=pillar_name,
+                description=pillar_description,
+                rationale=pillar_rationale,
+                epics=[
+                    Epic(
+                        epic_id="EPC-001",
+                        name=epic_name,
+                        description=epic_description,
+                        success_criteria=["dispatches tasks deterministically"],
+                        stories=[
+                            Story(
+                                story_id="STR-001",
+                                name=story_name,
+                                description=story_description,
+                                user_facing_behavior=behavior,
+                                tasks=tasks,
+                            )
+                        ],
+                    )
+                ],
+            )
+        ],
+    )
+
+
 @pytest.fixture(autouse=True)
 def _deterministic_embeddings_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("FACTORY_EMBEDDING_MODEL", "deterministic-hash-384")
+    monkeypatch.setenv("FACTORY_EMBEDDING_MODEL", "text-embedding-3-large")
+
+    class _DeterministicEmbeddingFunction:
+        def __init__(self, *, dims: int = 96) -> None:
+            self._dims = dims
+
+        def __call__(self, input):  # noqa: ANN001,ANN201
+            if isinstance(input, str):
+                values = [input]
+            else:
+                values = [str(item) for item in input]
+            vectors: list[list[float]] = []
+            for value in values:
+                digest = hashlib.sha256(value.encode("utf-8")).digest()
+                vector = [((digest[idx % len(digest)] / 255.0) * 2.0) - 1.0 for idx in range(self._dims)]
+                vectors.append(vector)
+            return vectors
+
+        def embed_query(self, input):  # noqa: ANN001,ANN201
+            return self.__call__(input)
+
+        @staticmethod
+        def name() -> str:
+            return "default"
+
+        @staticmethod
+        def build_from_config(config: dict[str, object]):  # noqa: ANN205
+            dims_raw = config.get("dims")
+            if isinstance(dims_raw, int) and dims_raw > 0:
+                return _DeterministicEmbeddingFunction(dims=dims_raw)
+            return _DeterministicEmbeddingFunction()
+
+        def get_config(self) -> dict[str, object]:
+            return {"dims": self._dims}
+
+        def is_legacy(self) -> bool:
+            return False
+
+        def default_space(self) -> str:
+            return "cosine"
+
+        def supported_spaces(self) -> list[str]:
+            return ["cosine", "l2", "ip"]
+
+    monkeypatch.setattr(
+        "dcode_app_factory.registry._build_embedding_function",
+        lambda *, model_name: _DeterministicEmbeddingFunction(),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _mock_product_spec_planner(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_planner(
+        *,
+        raw_request: str,
+        spec_id: str,
+        request_kind: str,
+        target_codebase_root: str | None,
+    ) -> ProductSpec:
+        return _build_mock_product_spec(
+            raw_request=raw_request,
+            spec_id=spec_id,
+            request_kind=request_kind,
+            target_codebase_root=target_codebase_root,
+        )
+
+    monkeypatch.setattr("dcode_app_factory.utils._invoke_product_spec_planner", _fake_planner)
 
 
 @pytest.fixture(autouse=True)
@@ -236,6 +598,82 @@ def _mock_role_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
 
     def _fake_invoke_structured(self, *, role: str, schema, prompt: str):  # noqa: ANN001,ANN201
         _ = self, role
+        if getattr(schema, "__name__", "") == "ModuleImplementationDraft":
+            contract_payload = _extract_json_after(prompt, "Contract")
+            module_id = str(contract_payload.get("module_id", "MM-test"))
+            module_version = str(contract_payload.get("module_version", "1.0.0"))
+            inputs_payload = contract_payload.get("inputs", [])
+            outputs_payload = contract_payload.get("outputs", [])
+            input_names = [
+                str(item.get("name"))
+                for item in inputs_payload
+                if isinstance(item, dict) and isinstance(item.get("name"), str)
+            ]
+            output_names = [
+                str(item.get("name"))
+                for item in outputs_payload
+                if isinstance(item, dict) and isinstance(item.get("name"), str)
+            ]
+            sample_inputs: dict[str, str] = {}
+            for item in inputs_payload:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if not isinstance(name, str):
+                    continue
+                constraints = item.get("constraints")
+                if isinstance(constraints, list) and constraints and isinstance(constraints[0], str) and constraints[0].strip():
+                    sample_inputs[name] = constraints[0].strip()
+                else:
+                    sample_inputs[name] = f"value-{name}"
+
+            source = (
+                "from __future__ import annotations\n\n"
+                "import hashlib\n"
+                "from collections.abc import Mapping\n\n"
+                f"MODULE_REF = {json.dumps(module_id + '@' + module_version)}\n"
+                f"REQUIRED_INPUTS = {json.dumps(input_names)}\n"
+                f"OUTPUT_FIELDS = {json.dumps(output_names)}\n\n"
+                "def _normalize_inputs(inputs: Mapping[str, str]) -> dict[str, str]:\n"
+                "    if not isinstance(inputs, Mapping):\n"
+                "        raise TypeError('inputs must be a mapping')\n"
+                "    normalized: dict[str, str] = {}\n"
+                "    for key in REQUIRED_INPUTS:\n"
+                "        if key not in inputs:\n"
+                "            raise ValueError(f'Missing required input: {key}')\n"
+                "        raw_value = inputs[key]\n"
+                "        if not isinstance(raw_value, str):\n"
+                "            raise TypeError(f'Input {key!r} must be a string')\n"
+                "        value = raw_value.strip()\n"
+                "        if not value:\n"
+                "            raise ValueError(f'Input {key!r} must be non-empty')\n"
+                "        normalized[key] = value\n"
+                "    return normalized\n\n"
+                "def execute(inputs: Mapping[str, str]) -> dict[str, str]:\n"
+                "    normalized = _normalize_inputs(inputs)\n"
+                "    joined = '|'.join(f\"{k}={normalized[k]}\" for k in REQUIRED_INPUTS)\n"
+                "    digest = hashlib.sha256(joined.encode('utf-8')).hexdigest()\n"
+                "    outputs: dict[str, str] = {}\n"
+                "    for index, key in enumerate(OUTPUT_FIELDS):\n"
+                "        start = (index * 8) % len(digest)\n"
+                "        outputs[key] = digest[start:start + 16]\n"
+                "    return outputs\n\n"
+                "def verify_contract() -> dict[str, object]:\n"
+                f"    sample_inputs = {json.dumps(sample_inputs, sort_keys=True)}\n"
+                "    return {\n"
+                "        'module_ref': MODULE_REF,\n"
+                "        'sample_inputs': sample_inputs,\n"
+                "        'outputs': execute(sample_inputs),\n"
+                "    }\n"
+            )
+            return schema(
+                module_source=source,
+                sample_inputs=sample_inputs,
+                verification_checks=[
+                    "execute validates required input keys",
+                    "execute returns contract output keys",
+                ],
+            )
         if schema is DependencyManagerDecision:
             return schema(approved=True, rationale="dependency graph valid", blocking_dependencies=[])
         if schema is DispatchDecision:
@@ -296,10 +734,9 @@ class _FakeDebateGraphPass:
         *,
         store: FactoryStateStore,
         role_runtime: RoleAgentRuntime,
-        use_llm: bool = True,
         propagate_parent_halt: bool = False,
     ) -> None:
-        _ = store, role_runtime, use_llm, propagate_parent_halt
+        _ = store, role_runtime, propagate_parent_halt
 
     def run(
         self,
@@ -322,10 +759,9 @@ class _FakeDebateGraphFailFirst:
         *,
         store: FactoryStateStore,
         role_runtime: RoleAgentRuntime,
-        use_llm: bool = True,
         propagate_parent_halt: bool = False,
     ) -> None:
-        _ = store, role_runtime, use_llm, propagate_parent_halt
+        _ = store, role_runtime, propagate_parent_halt
 
     def run(
         self,
@@ -614,8 +1050,51 @@ def test_code_index_records_level_owner_and_compatibility(tmp_path: Path) -> Non
     assert entry.compatibility_type == ContractCompatibility.NON_BREAKING
 
 
+def test_code_index_get_and_items_return_latest_persisted_contract(tmp_path: Path) -> None:
+    state_store = FactoryStateStore(tmp_path, project_id="ACME-IDX-GET")
+    index = CodeIndex(state_store.code_index_dir, embedding_model="text-embedding-3-large")
+
+    base_contract = dict(
+        module_id="MM-history",
+        name="Historical Module",
+        purpose="Tracks contract versions",
+        tags=["history"],
+        examples_ref="/modules/MM-history/1.0.0/examples.md",
+        created_by="tester",
+        inputs=[ContractInput(name="request", type="dict", constraints=["non-empty"])],
+        outputs=[ContractOutput(name="response", type="dict", invariants=["deterministic"])],
+        error_surfaces=[ContractErrorSurface(name="ValidationError", when="bad request", surface="exception")],
+        effects=[{"type": EffectType.WRITE, "target": "state_store", "description": "writes artifacts"}],
+        modes=ContractModes(sync=True, **{"async": False}, notes="sync"),
+        error_cases=["bad request"],
+        dependencies=[],
+        compatibility=CompatibilityRule(backward_compatible_with=[], breaking_change_policy="major"),
+        runtime_budgets=RuntimeBudgets(latency_ms_p95=15, memory_mb_max=64),
+        status=ArtifactStatus.DRAFT,
+    )
+    contract_v1 = MicroModuleContract(module_version="1.0.0", **base_contract)
+    contract_v2 = MicroModuleContract(module_version="1.0.1", **base_contract)
+    index.register(contract_v1)
+    index.register(contract_v2)
+
+    for contract in (contract_v1, contract_v2):
+        contract_path = state_store.modules_dir / contract.module_id / contract.module_version / "contract.json"
+        contract_path.parent.mkdir(parents=True, exist_ok=True)
+        contract_path.write_text(contract.model_dump_json(indent=2, by_alias=True), encoding="utf-8")
+
+    loaded = index.get("MM-history")
+    assert loaded is not None
+    assert loaded.module_version == "1.0.1"
+
+    items = index.items()
+    assert len(items) == 1
+    slug, latest = items[0]
+    assert slug == "historical-module"
+    assert latest.module_version == "1.0.1"
+
+
 def test_code_index_reindexes_when_embedding_model_changes(tmp_path: Path) -> None:
-    index = CodeIndex(tmp_path, embedding_model="deterministic-hash-96")
+    index = CodeIndex(tmp_path, embedding_model="text-embedding-3-large")
     contract = MicroModuleContract(
         module_id="MM-reindex",
         module_version="1.0.0",
@@ -637,8 +1116,8 @@ def test_code_index_reindexes_when_embedding_model_changes(tmp_path: Path) -> No
     )
     index.register(contract)
 
-    CodeIndex(tmp_path, embedding_model="deterministic-hash-64")
-    assert (tmp_path / "embedding_model.txt").read_text(encoding="utf-8").strip() == "deterministic-hash-64"
+    CodeIndex(tmp_path, embedding_model="text-embedding-3-small")
+    assert (tmp_path / "embedding_model.txt").read_text(encoding="utf-8").strip() == "text-embedding-3-small"
     events = [
         line.strip()
         for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
@@ -670,12 +1149,6 @@ def test_build_project_state_assigns_declaration_order() -> None:
     assert sorted(orders) == list(range(len(orders)))
 
 
-def test_runtime_settings_enable_llm_debate_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("FACTORY_DEBATE_USE_LLM", raising=False)
-    settings = RuntimeSettings.from_env()
-    assert settings.debate_use_llm is True
-
-
 def test_runtime_settings_default_embedding_model_is_openai(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FACTORY_EMBEDDING_MODEL", raising=False)
     settings = RuntimeSettings.from_env()
@@ -686,6 +1159,16 @@ def test_runtime_settings_default_class_contract_policy(monkeypatch: pytest.Monk
     monkeypatch.delenv("FACTORY_CLASS_CONTRACT_POLICY", raising=False)
     settings = RuntimeSettings.from_env()
     assert settings.class_contract_policy == "selective_shared"
+
+
+def test_load_raw_request_fails_when_default_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    factory_main = _load_factory_main_module()
+    missing_default = tmp_path / "missing_request.md"
+    monkeypatch.setenv("FACTORY_DEFAULT_REQUEST_PATH", str(missing_default))
+    monkeypatch.delenv("FACTORY_DEFAULT_SPEC_PATH", raising=False)
+
+    with pytest.raises(FileNotFoundError, match="Default request file does not exist"):
+        factory_main.load_raw_request(request_file=None, request_text=None, spec_file=None)
 
 
 def test_normalize_structured_output_accepts_include_raw_shape() -> None:
@@ -803,9 +1286,13 @@ def test_debate_graph_llm_path_uses_function_calling_structured_outputs(
     monkeypatch.setattr("dcode_app_factory.agent_runtime.RoleAgentRuntime.structured_adapter", _fake_structured_adapter)
 
     store = FactoryStateStore(tmp_path)
-    settings = RuntimeSettings(state_store_root=str(tmp_path), project_id="ACME-DEBATE-1", embedding_model="deterministic-hash-384")
+    settings = RuntimeSettings(
+        state_store_root=str(tmp_path),
+        project_id="ACME-DEBATE-1",
+        embedding_model="text-embedding-3-large",
+    )
     role_runtime = RoleAgentRuntime(stage="engineering_loop", settings=settings, backend_root=store.root)
-    debate = DebateGraph(store=store, role_runtime=role_runtime, use_llm=True)
+    debate = DebateGraph(store=store, role_runtime=role_runtime)
     result = debate.run(
         task_id="T-demo-demo-demo-1",
         module_id="MM-demo-1",
@@ -870,9 +1357,13 @@ def test_debate_graph_halt_returns_without_parent_command(tmp_path: Path) -> Non
             }
 
     store = FactoryStateStore(tmp_path)
-    settings = RuntimeSettings(state_store_root=str(tmp_path), project_id="ACME-DEBATE-2", embedding_model="deterministic-hash-384")
+    settings = RuntimeSettings(
+        state_store_root=str(tmp_path),
+        project_id="ACME-DEBATE-2",
+        embedding_model="text-embedding-3-large",
+    )
     role_runtime = RoleAgentRuntime(stage="engineering_loop", settings=settings, backend_root=store.root)
-    debate = _AlwaysFailDebate(store=store, role_runtime=role_runtime, use_llm=True)
+    debate = _AlwaysFailDebate(store=store, role_runtime=role_runtime)
     result = debate.run(
         task_id="T-demo-1",
         module_id="MM-demo-1",
@@ -893,7 +1384,7 @@ def test_project_loop_happy_path_with_mocked_debate(monkeypatch: pytest.MonkeyPa
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-001",
-        embedding_model="deterministic-hash-384",
+        embedding_model="text-embedding-3-large",
     )
     spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
     loop = ProjectLoop(
@@ -911,6 +1402,50 @@ def test_project_loop_happy_path_with_mocked_debate(monkeypatch: pytest.MonkeyPa
     assert state.project_id == settings.project_id
 
 
+def test_product_loop_treats_non_blocking_validator_rejection_as_advisory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def _fake_invoke_deepagent_json(
+        self,
+        *,
+        role: str,
+        system_prompt: str,
+        user_message: str,
+        tools: list,
+        name: str,
+    ) -> dict[str, object]:
+        _ = self, system_prompt, user_message, tools, name
+        if role == "validator":
+            return {
+                "approved": False,
+                "summary": "No blocking issues; warnings only.",
+                "warnings": [{"message": "criterion phrasing may be non-testable"}],
+                "blocking_issues": [],
+                "recommended_actions": [],
+            }
+        return {
+            "approved": True,
+            "summary": f"{role} approved",
+            "warnings": [],
+            "blocking_issues": [],
+            "recommended_actions": [],
+        }
+
+    monkeypatch.setattr(
+        "dcode_app_factory.agent_runtime.RoleAgentRuntime.invoke_deepagent_json",
+        _fake_invoke_deepagent_json,
+    )
+
+    settings = RuntimeSettings(
+        state_store_root=str(tmp_path),
+        project_id="ACME-ADVISORY",
+        embedding_model="text-embedding-3-large",
+    )
+    spec = ProductLoop("# Product\n## A", state_store_root=tmp_path, settings=settings).run()
+    assert spec.spec_id == "SPEC-001"
+
+
 def test_project_loop_emits_levelled_contract_artifacts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr("dcode_app_factory.loops.ProductLoop._invoke_deep_agent", lambda self, spec_json_path: None)
     monkeypatch.setattr("dcode_app_factory.loops.DebateGraph", _FakeDebateGraphPass)
@@ -918,7 +1453,7 @@ def test_project_loop_emits_levelled_contract_artifacts(monkeypatch: pytest.Monk
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-LVL-001",
-        embedding_model="deterministic-hash-384",
+        embedding_model="text-embedding-3-large",
         class_contract_policy="selective_shared",
     )
     spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
@@ -949,7 +1484,7 @@ def test_project_loop_halt_blocks_downstream(monkeypatch: pytest.MonkeyPatch, tm
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-002",
-        embedding_model="deterministic-hash-384",
+        embedding_model="text-embedding-3-large",
     )
     spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
     loop = ProjectLoop(
@@ -974,7 +1509,7 @@ def test_release_loop_flags_deprecated_dependency(monkeypatch: pytest.MonkeyPatc
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-003",
-        embedding_model="deterministic-hash-384",
+        embedding_model="text-embedding-3-large",
     )
     spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
     code_index = CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index")
@@ -1000,7 +1535,7 @@ def test_release_loop_includes_new_contract_and_context_gates(
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-REL-GATES",
-        embedding_model="deterministic-hash-384",
+        embedding_model="text-embedding-3-large",
     )
     spec = ProductLoop("# Product\n## A\n## B", state_store_root=tmp_path, settings=settings).run()
     code_index = CodeIndex(project_scoped_root(tmp_path, settings.project_id) / "code_index")
@@ -1018,13 +1553,16 @@ def test_release_loop_includes_new_contract_and_context_gates(
     assert gates["compatibility_check"] == "PASS"
     assert gates["ownership_check"] == "PASS"
     assert gates["context_pack_compliance_check"] == "PASS"
+    manifest_path = project.state_store.release_dir / f"{result['release_id']}.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert all(module["ship_ref"] is None or module["ship_ref"].startswith("/modules/") for module in manifest["modules"])
 
 
 def test_release_loop_expands_transitive_dependencies(tmp_path: Path) -> None:
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-REL-CLOSURE",
-        embedding_model="deterministic-hash-384",
+        embedding_model="text-embedding-3-large",
     )
     state_store = FactoryStateStore(tmp_path, project_id=settings.project_id)
     code_index = CodeIndex(state_store.code_index_dir, embedding_model=settings.embedding_model)
@@ -1055,33 +1593,69 @@ def test_release_loop_expands_transitive_dependencies(tmp_path: Path) -> None:
         status=ArtifactStatus.DRAFT,
     )
 
-    code_index.register(
-        MicroModuleContract(
-            module_id="MM-a",
-            module_version="1.0.0",
-            examples_ref="/modules/MM-a/1.0.0/examples.md",
-            dependencies=[],
-            **base_contract,
-        )
+    contract_a_100 = MicroModuleContract(
+        module_id="MM-a",
+        module_version="1.0.0",
+        examples_ref="/modules/MM-a/1.0.0/examples.md",
+        dependencies=[],
+        **base_contract,
     )
-    code_index.register(
-        MicroModuleContract(
-            module_id="MM-a",
-            module_version="1.0.1",
-            examples_ref="/modules/MM-a/1.0.1/examples.md",
-            dependencies=[],
-            **base_contract,
-        )
+    contract_a_101 = MicroModuleContract(
+        module_id="MM-a",
+        module_version="1.0.1",
+        examples_ref="/modules/MM-a/1.0.1/examples.md",
+        dependencies=[],
+        **base_contract,
     )
-    code_index.register(
-        MicroModuleContract(
-            module_id="MM-b",
-            module_version="1.0.0",
-            examples_ref="/modules/MM-b/1.0.0/examples.md",
-            dependencies=[{"ref": "MM-a@1.0.0", "why": "module dependency"}],
-            **base_contract,
-        )
+    contract_b_100 = MicroModuleContract(
+        module_id="MM-b",
+        module_version="1.0.0",
+        examples_ref="/modules/MM-b/1.0.0/examples.md",
+        dependencies=[{"ref": "MM-a@1.0.0", "why": "module dependency"}],
+        **base_contract,
     )
+    for idx, contract in enumerate((contract_a_100, contract_a_101, contract_b_100), start=1):
+        code_index.register(contract)
+        module_dir = state_store.modules_dir / contract.module_id / contract.module_version
+        tests_dir = module_dir / "tests"
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        (module_dir / "contract.json").write_text(contract.model_dump_json(indent=2, by_alias=True), encoding="utf-8")
+        (module_dir / "examples.md").write_text("# Example\n", encoding="utf-8")
+        evidence_ref = f"/modules/{contract.module_id}/{contract.module_version}/tests/execution_log.json"
+        coverage_ref = f"/modules/{contract.module_id}/{contract.module_version}/tests/coverage.json"
+        (tests_dir / "execution_log.json").write_text(
+            json.dumps({"result": "PASS"}, indent=2),
+            encoding="utf-8",
+        )
+        (tests_dir / "coverage.json").write_text(
+            json.dumps({"result": "PASS"}, indent=2),
+            encoding="utf-8",
+        )
+        (module_dir / "ship.json").write_text(
+            json.dumps(
+                {
+                    "module_id": contract.module_id,
+                    "module_version": contract.module_version,
+                    "ship_id": f"SHIP-{idx:08x}",
+                    "verified_at": datetime.now(UTC).isoformat(),
+                    "verification": {
+                        "result": "PASS",
+                        "interface_fingerprint": contract.interface_fingerprint,
+                        "evidence_ref": evidence_ref,
+                    },
+                    "environment": {
+                        "repo_revision": "local",
+                        "dependency_lock_ref": "uv.lock",
+                        "runner_id": "pytest",
+                    },
+                    "test_artifact_refs": [evidence_ref],
+                    "coverage_report_ref": coverage_ref,
+                    "ship_time": datetime.now(UTC).isoformat(),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     release = ReleaseLoop(state_store=state_store, code_index=code_index, spec=spec)
     result = release.run()
@@ -1097,7 +1671,7 @@ def test_outer_graph_runs_auto_approve_with_mocked_debate(monkeypatch: pytest.Mo
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-004",
-        embedding_model="deterministic-hash-384",
+        embedding_model="text-embedding-3-large",
     )
     orchestrator = FactoryOrchestrator(raw_spec="# Product\n## A\n## B", state_store_root=tmp_path, settings=settings)
     result = orchestrator.run(approval_action="APPROVE")
@@ -1112,7 +1686,7 @@ def test_checkpoint_files_created(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-005",
-        embedding_model="deterministic-hash-384",
+        embedding_model="text-embedding-3-large",
     )
     orchestrator = FactoryOrchestrator(raw_spec="# Product\n## A", state_store_root=tmp_path, settings=settings)
     orchestrator.run(approval_action="APPROVE")
@@ -1126,7 +1700,7 @@ def test_micro_plan_decomposes_into_atomic_modules(tmp_path: Path) -> None:
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-ATOMIC",
-        embedding_model="deterministic-hash-384",
+        embedding_model="text-embedding-3-large",
     )
     state_store = FactoryStateStore(tmp_path, project_id=settings.project_id)
     loop = EngineeringLoop(
@@ -1149,7 +1723,7 @@ def test_micro_plan_can_select_reuse_candidate(tmp_path: Path) -> None:
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-REUSE",
-        embedding_model="deterministic-hash-384",
+        embedding_model="text-embedding-3-large",
     )
     state_store = FactoryStateStore(tmp_path, project_id=settings.project_id)
     index = CodeIndex(state_store.code_index_dir, embedding_model=settings.embedding_model)
@@ -1191,7 +1765,7 @@ def test_engineering_loop_resolves_dependency_refs_and_versions_examples_path(tm
     settings = RuntimeSettings(
         state_store_root=str(tmp_path),
         project_id="ACME-DEP-REFS",
-        embedding_model="deterministic-hash-384",
+        embedding_model="text-embedding-3-large",
     )
     state_store = FactoryStateStore(tmp_path, project_id=settings.project_id)
     loop = EngineeringLoop(
@@ -1207,7 +1781,13 @@ def test_engineering_loop_resolves_dependency_refs_and_versions_examples_path(tm
         module_id="MM-dep-target",
         name="Dependency target [core-01]",
         purpose="Deterministic core logic",
-        io_contract=MicroIoContract(inputs=["validated"], outputs=["computed"]),
+        io_contract=MicroIoContract(
+            inputs=["validated"],
+            outputs=["computed"],
+            error_surfaces=["bad input"],
+            effects=["persist computed output"],
+            modes=["sync"],
+        ),
         error_cases=["bad input"],
         depends_on=["MM-dep-source"],
         reuse_candidate_refs=[],
@@ -1237,3 +1817,17 @@ def test_engineering_loop_resolves_dependency_refs_and_versions_examples_path(tm
     assert dependency_refs == ["MM-dep-source@2.4.6"]
     assert [entry.ref for entry in contract.dependencies] == ["MM-dep-source@2.4.6"]
     assert contract.examples_ref.endswith(f"/{contract.module_version}/examples.md")
+
+    evidence_ref, coverage_ref = loop._materialize_and_verify_module(contract=contract)
+    evidence_path = state_store.root / evidence_ref.lstrip("/")
+    coverage_path = state_store.root / coverage_ref.lstrip("/")
+    examples_path = state_store.modules_dir / contract.module_id / contract.module_version / "examples.md"
+    implementation_path = state_store.modules_dir / contract.module_id / contract.module_version / "implementation" / "module.py"
+
+    assert evidence_path.is_file()
+    assert coverage_path.is_file()
+    assert implementation_path.is_file()
+    examples = examples_path.read_text(encoding="utf-8")
+    assert "{\"sample\": true}" not in examples
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert payload["result"] == "PASS"

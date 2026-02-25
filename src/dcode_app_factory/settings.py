@@ -21,7 +21,6 @@ class RuntimeSettings:
     embedding_model: str = "text-embedding-3-large"
     recursion_limit: int = 1_000
     checkpoint_db: str = "state_store/checkpoints/langgraph.sqlite"
-    debate_use_llm: bool = True
     class_contract_policy: str = "selective_shared"
 
     @classmethod
@@ -39,7 +38,6 @@ class RuntimeSettings:
             embedding_model=os.getenv("FACTORY_EMBEDDING_MODEL", "text-embedding-3-large"),
             recursion_limit=_get_env_int("FACTORY_RECURSION_LIMIT", default=1_000, minimum=100),
             checkpoint_db=os.getenv("FACTORY_CHECKPOINT_DB", "state_store/checkpoints/langgraph.sqlite"),
-            debate_use_llm=_get_env_bool("FACTORY_DEBATE_USE_LLM", default=True),
             class_contract_policy=os.getenv("FACTORY_CLASS_CONTRACT_POLICY", "selective_shared"),
         ).normalized()
 
@@ -66,7 +64,6 @@ class RuntimeSettings:
             embedding_model=embedding_model,
             recursion_limit=self.recursion_limit,
             checkpoint_db=self.checkpoint_db,
-            debate_use_llm=self.debate_use_llm,
             class_contract_policy=class_contract_policy,
         )
 
@@ -97,15 +94,3 @@ def _get_env_int(name: str, default: int, minimum: int) -> int:
     if parsed < minimum:
         raise ValueError(f"{name} must be >= {minimum}, got: {parsed}")
     return parsed
-
-
-def _get_env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    value = raw.strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{name} must be boolean-like, got: {raw!r}")
